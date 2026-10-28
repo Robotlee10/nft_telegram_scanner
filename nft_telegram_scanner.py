@@ -35,14 +35,22 @@ def send_telegram_alert(contract_address, title, source_link):
         print(f"[-] Failed to send Telegram message: {e}")
 
 def scan_via_google_feed():
-    """Queries Google Index directly and parses the XML internally to bypass string errors."""
+    """Queries Google Index using dictionary-based parameter builds to prevent layout errors."""
     print("[*] Pulling query updates from Google Index Feeds...")
     
-    search_query = 'site:binance.com "agentid" "0x"'
-    encoded_query = urllib.parse.quote(search_query)
+    # Define our raw base parameters explicitly to isolate text blocks
+    base_url = "https://google.com"
+    query_string = 'site:binance.com "agentid" "0x"'
     
-    # Direct raw request to Google's official feed url
-    google_url = f"https://google.com{encoded_query}&hl=en-US&gl=US&ceid=US:en"
+    params = {
+        "q": query_string,
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en"
+    }
+    
+    # urlencode automatically escapes spaces, symbols, and adds correct parameter indicators (?, &)
+    google_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
@@ -53,7 +61,6 @@ def scan_via_google_feed():
             print(f"[-] Google Feed Pending: Status {response.status_code}.")
             return
 
-        # Parse the raw XML data block natively inside Python
         root = ET.fromstring(response.text)
         items = root.findall('.//item')
         

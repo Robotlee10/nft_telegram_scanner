@@ -22,11 +22,20 @@ DB_FILE = "mint_tracker.db"
 
 # Search queries targeting multi-source platforms
 SEARCH_QUERIES = [
+    # Explicit X (Twitter) Search Queries
+    'site:x.com "Binance Agentic Wallet" "mint" "0x"',
+    'site:x.com "Agentic ID" "free mint" "BNB Chain" "0x"',
+    'site:twitter.com "Binance Agentic Wallet" "mint" "0x"',
+    
+    # Binance Square, Substack & AI Agent Forums
     'site:binance.com/square "agentic" "mint" "0x"',
     'site:substack.com "Binance Agentic Wallet" "free mint" "0x"',
-    '"Binance Agentic Wallet" "mint" "BNB Chain" "0x"',
-    '"Boltbook" "mint log" "0x"'
+    '"Boltbook" "mint log" "0x"',
+    
+    # Broad catch-all query
+    '"Binance Agentic Wallet" "mint" "BNB Chain" "0x"'
 ]
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 

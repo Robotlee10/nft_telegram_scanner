@@ -37,7 +37,10 @@ def query_google_index(site_domain, platform_label):
     print(f"[*] Pulling query updates for {platform_label} via Google Index...")
     
     base_url = "https://google.com"
-    query_string = f'site:{site_domain} "agentid" "0x"'
+    
+    # Expanded query using search operators (OR) to capture variations of the terms
+    # This matches: (agentid OR "agent id" OR agentic) AND (mint OR free) AND "0x"
+    query_string = f'site:{site_domain} (agentid OR "agent id" OR agentic) (mint OR free) "0x"'
     
     params = {
         "q": query_string,
@@ -56,13 +59,11 @@ def query_google_index(site_domain, platform_label):
             print(f"[-] {platform_label} Feed Pending: Status {response.status_code}.")
             return
 
-        # LIVE LOG: Print out the raw page character count to prove we got data
         print(f"[🔍 DATA LOG] Downloaded {len(response.text)} bytes of raw text from Google index stream for {platform_label}.")
 
         contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
         found_addresses = contract_pattern.findall(response.text)
         
-        # LIVE LOG: Print out the total number of contract addresses found in this check window
         print(f"[🔍 DATA LOG] Found {len(found_addresses)} raw 0x addresses inside the {platform_label} index feed.")
         
         if not found_addresses:

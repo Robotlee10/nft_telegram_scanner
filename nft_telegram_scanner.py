@@ -6,6 +6,8 @@ import logging
 import sqlite3
 import httpx
 from tavily import AsyncTavilyClient
+from web3 import AsyncWeb3
+from web3.providers import AsyncHTTPProvider
 
 # ==========================================
 # CONFIGURATION
@@ -13,9 +15,9 @@ from tavily import AsyncTavilyClient
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "YOUR_TAVILY_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-
 BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed1.binance.org/")
-CHECK_INTERVAL_SECONDS = 3600  # Poll search index every û0 minutes
+
+CHECK_INTERVAL_SECONDS = 3600  # Poll search index every 5 minutes
 DB_FILE = "mint_tracker.db"
 
 # Search queries targeting multi-source platforms
@@ -27,6 +29,26 @@ SEARCH_QUERIES = [
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ==========================================
+# WEB3 & ERC-165 SETUP
+# ==========================================
+w3 = AsyncWeb3(AsyncHTTPProvider(BSC_RPC_URL))
+
+ERC165_ABI = [
+    {
+        "inputs": [{"internalType": "bytes4", "name": "interfaceId", "type": "bytes4"}],
+        "name": "supportsInterface",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
+ERC721_INTERFACE_ID = "0x80ac58cd"
+ERC1155_INTERFACE_ID = "0xd9b67a26"
+SELECTOR_SET_APPROVAL_FOR_ALL = "a22cb465"
+SELECTOR_MINT = "a0712d68"
 
 # ==========================================
 # PERSISTENT DATABASE (SQLite)
@@ -59,38 +81,79 @@ def mark_as_notified(address: str):
     conn.close()
 
 # ==========================================
-# ON-CHAIN BSC SMART CONTRACT VERIFIER
+# WEB3.PY CONTRACT SECURITY & NFT INSPECTOR
 # ==========================================
-async def is_valid_bsc_contract(client: httpx.AsyncClient, address: str) -> bool:
-    """Queries BSC node to verify address is an active smart contract."""
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "eth_getCode",
-        "params": [address, "latest"],
-        "id": 1
+async def inspect_contract(address: str) -> dict:
+    """Performs on-chain ABI and bytecode analysis using Web3.py."""
+    checksum_addr = w3.to_checksum_address(address)
+    result = {
+        "is_contract": False,
+        "is_nft": False,
+        "standard": "Unknown/Non-NFT",
+        "has_approval_risk": False,
+        "has_mint_selector": False,
+        "passed_security": False
     }
+
     try:
-        resp = await client.post(BSC_RPC_URL, json=payload, timeout=5.0)
-        if resp.status_code == 200:
-            result = resp.json().get("result", "0x")
-            return result != "0x" and len(result) > 2
+        # 1. Bytecode Check (EOA vs Contract)
+        code = await w3.eth.get_code(checksum_addr)
+        if not code or code == b"" or len(code) <= 2:
+            return result  # Wallet address / EOA
+        
+        result["is_contract"] = True
+        code_hex = code.hex()
+
+        # 2. Bytecode Selector Scanning
+        if SELECTOR_MINT in code_hex:
+            result["has_mint_selector"] = True
+        if SELECTOR_SET_APPROVAL_FOR_ALL in code_hex:
+            result["has_approval_risk"] = True
+
+        # 3. ERC-165 On-Chain Interface Query
+        contract = w3.eth.contract(address=checksum_addr, abi=ERC165_ABI)
+        
+        try:
+            if await contract.functions.supportsInterface(bytes.fromhex(ERC721_INTERFACE_ID[2:])).call():
+                result["is_nft"] = True
+                result["standard"] = "ERC-721"
+        except Exception:
+            pass
+
+        if not result["is_nft"]:
+            try:
+                if await contract.functions.supportsInterface(bytes.fromhex(ERC1155_INTERFACE_ID[2:])).call():
+                    result["is_nft"] = True
+                    result["standard"] = "ERC-1155"
+            except Exception:
+                pass
+
+        # 4. Filter Decision
+        if result["is_contract"] and (result["is_nft"] or result["has_mint_selector"]):
+            result["passed_security"] = True
+
     except Exception as e:
-        logging.warning(f"BSC RPC check failed for {address}: {e}")
-        return True
-    return False
+        logging.warning(f"Error inspecting contract {address}: {e}")
+
+    return result
 
 # ==========================================
-# SAFE TELEGRAM ALERT SENDER
+# TELEGRAM ALERT SENDER
 # ==========================================
-async def send_telegram_alert(client: httpx.AsyncClient, contract: str, source: str, snippet: str, link: str):
-    """Sends HTML-formatted alert to Telegram."""
+async def send_telegram_alert(client: httpx.AsyncClient, contract: str, source: str, snippet: str, link: str, report: dict):
+    """Sends alert formatted with Web3 verification status."""
     clean_snippet = html.escape(snippet[:300])
     agent_command = f"Access my Binance Agentic Wallet. Call the write function mint(1) on BNB Chain at contract address {contract} with value 0 BNB."
+
+    nft_status = f"✅ Verified {report['standard']}" if report['is_nft'] else "⚠️ Unconfirmed Standard"
+    drain_risk = "⚠️ Approval Functions Found" if report['has_approval_risk'] else "🟢 Low Risk"
 
     message = (
         f"🚨 <b>FREE NFT MINT DETECTED</b> 🚨\n\n"
         f"📍 <b>Source:</b> {html.escape(source)}\n"
         f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
+        f"🛡️ <b>NFT Standard:</b> {nft_status}\n"
+        f"🔒 <b>Drainer Risk Check:</b> {drain_risk}\n"
         f"🔗 <b>BscScan:</b> https://bscscan.com/address/{contract}\n"
         f"🌐 <b>Source Link:</b> {link}\n\n"
         f"📝 <b>Context Snippet:</b>\n<i>{clean_snippet}...</i>\n\n"
@@ -114,26 +177,24 @@ async def send_telegram_alert(client: httpx.AsyncClient, contract: str, source: 
         logging.error(f"Failed sending alert: {e}")
 
 # ==========================================
-# CORE AGGREGATOR ENGINE
+# TAVILY SEARCH ENGINE
 # ==========================================
 async def run_search_aggr(tavily_client: AsyncTavilyClient, http_client: httpx.AsyncClient):
+    """Scans Web3 sources via Tavily API and passes contract candidates to Web3 inspector."""
     for query in SEARCH_QUERIES:
         try:
-            # Time-bounded search (filters results published recently)
             response = await tavily_client.search(
                 query=query, 
                 search_depth="advanced", 
                 time_range="day"
             )
             
-            results = response.get("results", [])
-            for item in results:
-                title = item.get("title", "")
+            for item in response.get("results", []):
                 snippet = item.get("content", "")
+                full_text = f"{item.get('title', '')} {snippet}"
                 url = item.get("url", "")
-                full_text = f"{title} {snippet}"
                 
-                # Extract EVM 0x contract addresses
+                # Extract EVM contract addresses
                 found_contracts = re.findall(r"0x[a-fA-F0-9]{40}", full_text)
                 for addr in set(found_contracts):
                     addr_lower = addr.lower()
@@ -141,25 +202,29 @@ async def run_search_aggr(tavily_client: AsyncTavilyClient, http_client: httpx.A
                     if is_already_notified(addr_lower):
                         continue
                     
-                    # Validate contract code on BSC
-                    if await is_valid_bsc_contract(http_client, addr_lower):
+                    # Run Web3 On-Chain Inspection before alerting
+                    report = await inspect_contract(addr_lower)
+                    if report["passed_security"]:
                         mark_as_notified(addr_lower)
                         await send_telegram_alert(
                             http_client,
                             addr,
                             f"Multi-Source Search Index ({url})",
                             snippet,
-                            url
+                            url,
+                            report
                         )
+                    else:
+                        logging.info(f"Filtered out {addr}: Not a valid NFT contract.")
         except Exception as e:
-            logging.error(f"Search aggregation failed for query '{query}': {e}")
+            logging.error(f"Search query failed for '{query}': {e}")
 
 # ==========================================
-# MAIN LOOP
+# MAIN EXECUTION LOOP
 # ==========================================
 async def main():
     init_db()
-    logging.info("Starting Multi-Source Search Aggregator Mint Scanner...")
+    logging.info("Starting Tavily Search + Web3 Security Mint Scanner...")
 
     tavily_client = AsyncTavilyClient(api_key=TAVILY_API_KEY)
 

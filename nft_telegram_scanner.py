@@ -18,7 +18,6 @@ def verify_env_variables():
     return True
 
 def send_telegram_alert(contract_address, platform_name):
-    # Includes your verified working Telegram endpoint format
     url = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
     
     message = (
@@ -35,11 +34,9 @@ def send_telegram_alert(contract_address, platform_name):
         print(f"[-] Failed to send Telegram message: {e}")
 
 def query_google_index(site_domain, platform_label):
-    """Queries Google's index for a specific domain to scan text safely."""
     print(f"[*] Pulling query updates for {platform_label} via Google Index...")
     
     base_url = "https://google.com"
-    # Target specific site, agentid community tag, and hex contract layouts
     query_string = f'site:{site_domain} "agentid" "0x"'
     
     params = {
@@ -59,12 +56,17 @@ def query_google_index(site_domain, platform_label):
             print(f"[-] {platform_label} Feed Pending: Status {response.status_code}.")
             return
 
-        # Scan text block smoothly via regex
+        # LIVE LOG: Print out the raw page character count to prove we got data
+        print(f"[🔍 DATA LOG] Downloaded {len(response.text)} bytes of raw text from Google index stream for {platform_label}.")
+
         contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
         found_addresses = contract_pattern.findall(response.text)
         
+        # LIVE LOG: Print out the total number of contract addresses found in this check window
+        print(f"[🔍 DATA LOG] Found {len(found_addresses)} raw 0x addresses inside the {platform_label} index feed.")
+        
         if not found_addresses:
-            print(f"[*] {platform_label} Connection Stable (Status 200). No new addresses found.")
+            print(f"[*] {platform_label} Connection Stable. No text blocks matching our criteria found.")
             return
 
         unique_addresses = set(found_addresses)
@@ -77,24 +79,19 @@ def query_google_index(site_domain, platform_label):
                 new_discoveries += 1
                 
         if new_discoveries > 0:
-            print(f"[+] Found {new_discoveries} new address layouts on {platform_label}.")
+            print(f"[+] Found {new_discoveries} brand-new contract addresses on {platform_label}.")
+        else:
+            print(f"[*] All {len(unique_addresses)} addresses in this stream have already been notified. Standing by.")
                     
     except Exception as e:
         print(f"[-] {platform_label} scan tracking failure: {e}")
 
 if __name__ == "__main__":
-    print("[➔] Starting Shielded Dual-Feed Free Mint Engine.")
+    print("[➔] Starting Shielded Dual-Feed Free Mint Engine with Live Data Logs.")
     if verify_env_variables():
         print("[➔] Monitoring mode active.")
         while True:
-            # Step 1: Scan Binance Square
             query_google_index("binance.com", "Binance Square")
-            
-            # Small delay to keep network calls cleanly separated
             time.sleep(5) 
-            
-            # Step 2: Scan X (Twitter)
             query_google_index("x.com", "X (Twitter)")
-            
-            # Wait for next check cycle
             time.sleep(SCAN_INTERVAL_SECONDS)

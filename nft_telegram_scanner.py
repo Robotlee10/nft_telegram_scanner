@@ -4,8 +4,8 @@ import requests
 from bs4 import BeautifulSoup
 
 # CONFIGURATION
-TELEGRAM_TOKEN = 9139372750:AAHlXAulHvu79mc9_mvO2CZVY5iZhSuGe3k
-CHAT_ID = 5036813076
+TELEGRAM_TOKEN = "9139372750:AAHlXAulHvu79mc9_mvO2CZVY5iZhSuGe3k"
+CHAT_ID = "5036813076"
 SCAN_INTERVAL_SECONDS = 300  # Scan every 5 minutes
 
 # Tracking set to avoid duplicate notifications for the same contract

@@ -24,6 +24,7 @@ BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed1.binance.org/")
 
 # Target channels to monitor (without @)
 TARGET_CHANNELS = [
+    "robotlee_10group",
     "binance_alpha_calls",
     "bsc_gems",
     "Airdrop_farming"

@@ -37,18 +37,21 @@ def scan_via_google_feed():
     """Queries Google's indexing cluster to grab web data completely bypassing firewalls."""
     print("[*] Pulling query updates from Google Index Feeds...")
     
-    # Target keyword to find minting events
+    # 1. Properly target keywords
     search_query = 'site:binance.com "agentid" "0x"'
     encoded_query = urllib.parse.quote(search_query)
     
-    # Route through Google's open RSS lookup cluster
+    # 2. Build the Google RSS link
     google_feed_url = f"https://google.com{encoded_query}&hl=en-US&gl=US&ceid=US:en"
     
-    # Convert the XML cluster feed directly to JSON using a highly stable public parsing framework
-    bridge_url = f"https://rss2json.com{urllib.parse.quote(google_feed_url)}"
+    # 3. Cleanly encode the link to pass into the converter api
+    encoded_google_url = urllib.parse.quote(google_feed_url, safe='')
+    bridge_url = f"https://rss2json.com{encoded_google_url}"
     
     try:
-        response = requests.get(bridge_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        # Pass a standard browser header to keep the endpoint connection fresh
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        response = requests.get(bridge_url, headers=headers, timeout=15)
         
         if response.status_code != 200:
             print(f"[-] Feed Stream Pending: Status {response.status_code}. Retrying next cycle.")
@@ -61,12 +64,12 @@ def scan_via_google_feed():
             print("[*] Connection Stable (Status 200). Waiting for new community posts.")
             return
 
-        # Pattern to pull out the 40-character BSC/ERC-20 hex layout
+        # Pattern to pull out the 40-character BSC/ERC-20 hex wallet/contract format
         contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
         
         for item in items:
             title_text = item.get("title", "")
-            description_text = item.get("content", "")
+            description_text = item.get("content", "") or item.get("description", "")
             combined_body = f"{title_text} {description_text}"
             
             match = contract_pattern.search(combined_body)

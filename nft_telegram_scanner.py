@@ -82,6 +82,9 @@ if __name__ == "__main__":
     print("[➔] Starting Shielded Free Mint Feed Engine.")
     if verify_env_variables():
         print("[➔] Monitoring mode active.")
+        if verify_env_variables():
+    print("[➔] Monitoring mode active.")
+    send_telegram_alert("0x3ed6b84a921d7b102ef757876a3e2001a1c3e4f0") # Temporary Test Line
         while True:
             scan_via_google_feed()
             time.sleep(SCAN_INTERVAL_SECONDS)

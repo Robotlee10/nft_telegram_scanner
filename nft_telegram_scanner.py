@@ -1,129 +1,233 @@
 import os
-import time
 import re
-import requests
+import asyncio
+import logging
+import sqlite3
 import xml.etree.ElementTree as ET
+from datetime import datetime
+import httpx
 from bs4 import BeautifulSoup
 
-# SECURE CONFIGURATION
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SCAN_INTERVAL_SECONDS = 60  # Check every 60 seconds for near real-time alerts
+# ==========================================
+# CONFIGURATION
+# ==========================================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
-# TARGET CONFIGURATION - Replace these example handles with your favorite callers
-TARGET_X_ACCOUNTS = ["Airdrop_Farming", "Crypto_Alerts_AI"]  # Public X usernames
-TARGET_TELEGRAM_CHANNELS = ["robotlee_10group"]  # Public Telegram channel slugs
+# Public BSC RPC for on-chain verification
+BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed1.binance.org/")
 
-ALREADY_NOTIFIED_CONTRACTS = set()
+# Scanning Targets
+TELEGRAM_CHANNELS = [
+    "bsc_gems",
+    "binance_alpha_calls",
+    # Add target telegram channel handles here (without @ or t.me/)
+]
 
-def verify_env_variables():
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("[-] CRITICAL ERROR: Missing environment variables!")
-        return False
-    return True
+X_TARGET_USERS = [
+    "Airdrop_farming",
+    "binance",
+    "BNBCHAIN",
+    # Add target X handles here
+]
 
-def send_telegram_alert(contract_address, source, platform):
-    url = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
+# Nitter Fallback Pool
+NITTER_INSTANCES = [
+    "https://nitter.net",
+    "https://privacydev.net",
+    "https://nitter.poast.org",
+    "https://nitter.cz",
+]
+
+KEYWORDS = ["mint", "free", "agentic", "binance", ".ai", "claim", "nft"]
+CHECK_INTERVAL_SECONDS = 45
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# ==========================================
+# PERSISTENT DATABASE (SQLite)
+# ==========================================
+DB_FILE = "notified_contracts.db"
+
+def init_db():
+    """Initializes SQLite database to persist notified contracts across restarts."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS contracts (
+            address TEXT PRIMARY KEY,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def is_already_notified(address: str) -> bool:
+    """Checks if address has already been processed."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM contracts WHERE address = ?", (address.lower(),))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+def mark_as_notified(address: str):
+    """Saves processed contract address into database."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO contracts (address) VALUES (?)", (address.lower(),))
+    conn.commit()
+    conn.close()
+
+# ==========================================
+# ON-CHAIN BSC CONTRACT VERIFIER
+# ==========================================
+async def is_valid_bsc_contract(client: httpx.AsyncClient, address: str) -> bool:
+    """
+    Queries the BSC node to ensure the address is an actual deployed smart contract 
+    and not a user's wallet address or dead address.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getCode",
+        "params": [address, "latest"],
+        "id": 1
+    }
+    try:
+        response = await client.post(BSC_RPC_URL, json=payload, timeout=5.0)
+        if response.status_code == 200:
+            result = response.json().get("result", "0x")
+            # If code length is > 2 ('0x'), it is a smart contract
+            return result != "0x" and len(result) > 2
+    except Exception as e:
+        logging.warning(f"BSC RPC verification error for {address}: {e}")
+        # Default to True on RPC failure to avoid missing potential mints
+        return True
+    return False
+
+# ==========================================
+# TELEGRAM ALERT SENDER
+# ==========================================
+async def send_telegram_alert(client: httpx.AsyncClient, contract: str, source: str, snippet: str):
+    """Sends structured alert with actionable Claude Code / MCP execution payload."""
+    
+    # Formatted command string ready for direct agent execution
+    agent_command = f"Access my Binance Agentic Wallet. Call the write function mint(1) on BNB Chain at contract address {contract} with value 0 BNB."
+
     message = (
-        f"🚨 **INSTANT MINT DETECTED!** 🚨\n\n"
-        f"**Platform:** {platform}\n"
-        f"**Source:** @{source}\n\n"
-        f"**Contract Address:**\n`{contract_address}`\n\n"
-        "⚡ _Hurry! Use your Binance Agentic Wallet MCP server to execute this mint._"
+        f"🚨 **FREE NFT MINT DETECTED** 🚨\n\n"
+        f"📍 **Source:** {source}\n"
+        f"📄 **Contract Address:** `{contract}`\n"
+        f"🔗 **Explorer:** https://bscscan.com/address/{contract}\n\n"
+        f"📝 **Context Snippet:**\n_{snippet[:250]}..._\n\n"
+        f"🤖 **Direct Agent Command (Copy & Paste):**\n"
+        f"```bash\n{agent_command}\n```"
     )
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+    
     try:
-        requests.post(url, json=payload, timeout=10)
-        print(f"[+] Alert sent to Telegram: {contract_address} from {source} ({platform})")
+        res = await client.post(url, json=payload, timeout=10.0)
+        if res.status_code == 200:
+            logging.info(f"Successfully alerted contract: {contract}")
+        else:
+            logging.error(f"Failed to send Telegram alert: {res.text}")
     except Exception as e:
-        print(f"[-] Failed to send Telegram message: {e}")
+        logging.error(f"Telegram notification exception: {e}")
 
-def scan_x_via_nitter(username):
-    """Scans public X accounts instantly using a stable open Nitter proxy."""
-    print(f"[*] Checking X timeline for @{username}...")
-    
-    # We use a reliable public Nitter instance that serves instant RSS feeds
-    nitter_url = f"https://privacydev.net{username}/rss"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
+# ==========================================
+# ENGINE A: NITTER / TWITTER SCANNER
+# ==========================================
+async def scan_x_user(client: httpx.AsyncClient, username: str):
+    """Scans user RSS feed across multiple Nitter instances with failover."""
+    for instance in NITTER_INSTANCES:
+        rss_url = f"{instance}/{username}/rss"
+        try:
+            resp = await client.get(rss_url, timeout=8.0, follow_redirects=True)
+            if resp.status_code == 200 and "xml" in resp.headers.get("content-type", ""):
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item"):
+                    title = item.find("title").text if item.find("title") is not None else ""
+                    desc = item.find("description").text if item.find("description") is not None else ""
+                    content = f"{title} {desc}".lower()
+                    
+                    if any(kw in content for kw in KEYWORDS):
+                        await process_text_content(client, content, f"X (@{username})")
+                return # Exit loop if successful
+        except Exception:
+            continue # Try next instance on failure
+
+# ==========================================
+# ENGINE B: TELEGRAM CHANNEL SCANNER
+# ==========================================
+async def scan_telegram_channel(client: httpx.AsyncClient, channel_name: str):
+    """Scans public Telegram channel web previews."""
+    url = f"https://t.me/s/{channel_name}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     try:
-        response = requests.get(nitter_url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            print(f"[-] Nitter instance returned status {response.status_code} for @{username}")
-            return
-
-        # Nitter feeds use standard XML RSS formatting
-        root = ET.fromstring(response.text)
-        items = root.findall('.//item')
-        
-        contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
-        
-        for item in items:
-            title = item.find('title').text if item.find('title') is not None else ""
-            desc = item.find('description').text if item.find('description') is not None else ""
-            combined_text = f"{title} {desc}".lower()
+        resp = await client.get(url, headers=headers, timeout=10.0)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            messages = soup.find_all("div", class_="tgme_widget_message_text")
             
-            # Match parameters for free agentic mints
-            if "mint" in combined_text or "free" in combined_text or "agentic" in combined_text:
-                match = contract_pattern.search(combined_text)
-                if match:
-                    contract_address = match.group(0)
-                    if contract_address not in ALREADY_NOTIFIED_CONTRACTS:
-                        ALREADY_NOTIFIED_CONTRACTS.add(contract_address)
-                        send_telegram_alert(contract_address, username, "X (Twitter)")
-                        
+            for msg in messages:
+                text = msg.get_text(strip=True).lower()
+                if any(kw in text for kw in KEYWORDS):
+                    await process_text_content(client, text, f"Telegram (t.me/{channel_name})")
     except Exception as e:
-        print(f"[-] Failed to scan X user @{username}: {e}")
+        logging.warning(f"Failed scraping Telegram channel {channel_name}: {e}")
 
-def scan_telegram_preview(channel_name):
-    """Scans public Telegram channel message histories instantly via Web Previews."""
-    print(f"[*] Checking Telegram Channel @{channel_name}...")
+# ==========================================
+# CORE PARSING & FILTERING
+# ==========================================
+async def process_text_content(client: httpx.AsyncClient, text: str, source: str):
+    """Extracts 0x contract addresses, verifies on-chain status, and notifies."""
+    # Matches EVM contract addresses
+    found_addresses = re.findall(r"0x[a-fA-F0-9]{40}", text)
     
-    # Simple open-source endpoint layout for public channels
-    tme_url = f"https://t.me{channel_name}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
-    try:
-        response = requests.get(tme_url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            print(f"[-] Telegram preview returned status {response.status_code} for @{channel_name}")
-            return
+    for addr in set(found_addresses):
+        addr_lower = addr.lower()
+        if is_already_notified(addr_lower):
+            continue
 
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Grab text directly from Telegram message blocks
-        message_elements = soup.find_all(class_="tgme_widget_message_text")
-        contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
-        
-        for element in message_elements:
-            message_text = element.get_text()
-            lowered_text = message_text.lower()
-            
-            if "mint" in lowered_text or "free" in lowered_text or "agent" in lowered_text:
-                match = contract_pattern.search(message_text)
-                if match:
-                    contract_address = match.group(0)
-                    if contract_address not in ALREADY_NOTIFIED_CONTRACTS:
-                        ALREADY_NOTIFIED_CONTRACTS.add(contract_address)
-                        send_telegram_alert(contract_address, channel_name, "Telegram Channel")
-                        
-    except Exception as e:
-        print(f"[-] Failed to scan Telegram channel @{channel_name}: {e}")
+        # Check BSC On-Chain status
+        if await is_valid_bsc_contract(client, addr_lower):
+            mark_as_notified(addr_lower)
+            await send_telegram_alert(client, addr, source, text)
+
+# ==========================================
+# MAIN CONTROLLER LOOP
+# ==========================================
+async def main():
+    init_db()
+    logging.info("Starting Dual-Engine Free NFT Mint Scanner...")
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                tasks = []
+                for user in X_TARGET_USERS:
+                    tasks.append(scan_x_user(client, user))
+                for channel in TELEGRAM_CHANNELS:
+                    tasks.append(scan_telegram_channel(client, channel))
+                
+                await asyncio.gather(*tasks)
+            except Exception as e:
+                logging.error(f"Error in execution loop: {e}")
+
+            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    print("[➔] Starting Instant Multi-Engine Free Mint Monitor.")
-    if verify_env_variables():
-        print(f"[➔] Real-time engine active. Cycling every {SCAN_INTERVAL_SECONDS} seconds.")
-        while True:
-            # 1. Process X Targets
-            for x_user in TARGET_X_ACCOUNTS:
-                scan_x_via_nitter(x_user)
-                time.sleep(2)  # Avoid flooding cloud nodes
-                
-            # 2. Process Telegram Targets
-            for tg_channel in TARGET_TELEGRAM_CHANNELS:
-                scan_telegram_preview(tg_channel)
-                time.sleep(2)
-                
-            print("[*] Scan loop complete. Standing by for updates...\n")
-            time.sleep(SCAN_INTERVAL_SECONDS)
+    asyncio.run(main())

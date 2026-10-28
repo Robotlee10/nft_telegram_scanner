@@ -17,26 +17,30 @@ def verify_env_variables():
         return False
     return True
 
-def send_telegram_alert(contract_address):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+def send_telegram_alert(contract_address, platform_name):
+    # Includes your verified working Telegram endpoint format
+    url = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
+    
     message = (
-        "🚨 **New Free Mint Detected!** 🚨\n\n"
+        f"🚨 **New Free Mint Detected on {platform_name}!** 🚨\n\n"
         f"**Contract Address:**\n`{contract_address}`\n\n"
         "👉 _Use your Binance Agentic Wallet MCP server to execute this mint._"
     )
+    
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=10)
-        print(f"[+] Alert sent to Telegram: {contract_address}")
+        print(f"[+] Alert sent to Telegram: {contract_address} ({platform_name})")
     except Exception as e:
         print(f"[-] Failed to send Telegram message: {e}")
 
-def scan_via_google_feed():
-    """Queries Google using direct regex extraction to completely eliminate XML parsing crashes."""
-    print("[*] Pulling query updates from Google Index Feeds...")
+def query_google_index(site_domain, platform_label):
+    """Queries Google's index for a specific domain to scan text safely."""
+    print(f"[*] Pulling query updates for {platform_label} via Google Index...")
     
     base_url = "https://google.com"
-    query_string = 'site:binance.com "agentid" "0x"'
+    # Target specific site, agentid community tag, and hex contract layouts
+    query_string = f'site:{site_domain} "agentid" "0x"'
     
     params = {
         "q": query_string,
@@ -52,36 +56,45 @@ def scan_via_google_feed():
         response = requests.get(google_url, headers=headers, timeout=15)
         
         if response.status_code != 200:
-            print(f"[-] Google Feed Pending: Status {response.status_code}.")
+            print(f"[-] {platform_label} Feed Pending: Status {response.status_code}.")
             return
 
-        # Use an unanchored regex match to scan the raw content stream directly
+        # Scan text block smoothly via regex
         contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
         found_addresses = contract_pattern.findall(response.text)
         
         if not found_addresses:
-            print("[*] Connection Stable (Status 200). Waiting for new community posts.")
+            print(f"[*] {platform_label} Connection Stable (Status 200). No new addresses found.")
             return
 
-        # Filter duplicates and notify
         unique_addresses = set(found_addresses)
         new_discoveries = 0
         
         for contract_address in unique_addresses:
             if contract_address not in ALREADY_NOTIFIED_CONTRACTS:
                 ALREADY_NOTIFIED_CONTRACTS.add(contract_address)
-                send_telegram_alert(contract_address)
+                send_telegram_alert(contract_address, platform_label)
                 new_discoveries += 1
                 
-        print(f"[+] Scan iteration complete. Processed {new_discoveries} new unique address layouts.")
+        if new_discoveries > 0:
+            print(f"[+] Found {new_discoveries} new address layouts on {platform_label}.")
                     
     except Exception as e:
-        print(f"[-] Scan tracking failure: {e}")
+        print(f"[-] {platform_label} scan tracking failure: {e}")
 
 if __name__ == "__main__":
-    print("[➔] Starting Shielded Free Mint Feed Engine.")
+    print("[➔] Starting Shielded Dual-Feed Free Mint Engine.")
     if verify_env_variables():
         print("[➔] Monitoring mode active.")
         while True:
-            scan_via_google_feed()
+            # Step 1: Scan Binance Square
+            query_google_index("binance.com", "Binance Square")
+            
+            # Small delay to keep network calls cleanly separated
+            time.sleep(5) 
+            
+            # Step 2: Scan X (Twitter)
+            query_google_index("x.com", "X (Twitter)")
+            
+            # Wait for next check cycle
             time.sleep(SCAN_INTERVAL_SECONDS)

@@ -3,7 +3,6 @@ import time
 import re
 import requests
 import urllib.parse
-import xml.etree.ElementTree as ET
 
 # SECURE CONFIGURATION
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -18,16 +17,14 @@ def verify_env_variables():
         return False
     return True
 
-def send_telegram_alert(contract_address, title, source_link):
+def send_telegram_alert(contract_address):
     url = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
     message = (
         "🚨 **New Free Mint Detected!** 🚨\n\n"
         f"**Contract Address:**\n`{contract_address}`\n\n"
-        f"**Context:** {title}\n\n"
-        f"🔗 [View Source Link]({source_link})\n\n"
         "👉 _Use your Binance Agentic Wallet MCP server to execute this mint._"
     )
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=10)
         print(f"[+] Alert sent to Telegram: {contract_address}")
@@ -35,10 +32,9 @@ def send_telegram_alert(contract_address, title, source_link):
         print(f"[-] Failed to send Telegram message: {e}")
 
 def scan_via_google_feed():
-    """Queries Google Index using dictionary-based parameter builds to prevent layout errors."""
+    """Queries Google using direct regex extraction to completely eliminate XML parsing crashes."""
     print("[*] Pulling query updates from Google Index Feeds...")
     
-    # Define our raw base parameters explicitly to isolate text blocks
     base_url = "https://google.com"
     query_string = 'site:binance.com "agentid" "0x"'
     
@@ -49,9 +45,7 @@ def scan_via_google_feed():
         "ceid": "US:en"
     }
     
-    # urlencode automatically escapes spaces, symbols, and adds correct parameter indicators (?, &)
     google_url = f"{base_url}?{urllib.parse.urlencode(params)}"
-    
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
     try:
@@ -61,31 +55,25 @@ def scan_via_google_feed():
             print(f"[-] Google Feed Pending: Status {response.status_code}.")
             return
 
-        root = ET.fromstring(response.text)
-        items = root.findall('.//item')
+        # Use an unanchored regex match to scan the raw content stream directly
+        contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
+        found_addresses = contract_pattern.findall(response.text)
         
-        if not items:
+        if not found_addresses:
             print("[*] Connection Stable (Status 200). Waiting for new community posts.")
             return
 
-        contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
+        # Filter duplicates and notify
+        unique_addresses = set(found_addresses)
+        new_discoveries = 0
         
-        for item in items:
-            title_text = item.find('title').text if item.find('title') is not None else ""
-            description_text = item.find('description').text if item.find('description') is not None else ""
-            link_text = item.find('link').text if item.find('link') is not None else "https://binance.com"
-            
-            combined_body = f"{title_text} {description_text}"
-            
-            match = contract_pattern.search(combined_body)
-            if match:
-                contract_address = match.group(0)
+        for contract_address in unique_addresses:
+            if contract_address not in ALREADY_NOTIFIED_CONTRACTS:
+                ALREADY_NOTIFIED_CONTRACTS.add(contract_address)
+                send_telegram_alert(contract_address)
+                new_discoveries += 1
                 
-                if contract_address not in ALREADY_NOTIFIED_CONTRACTS:
-                    ALREADY_NOTIFIED_CONTRACTS.add(contract_address)
-                    send_telegram_alert(contract_address, title_text, link_text)
-                    
-        print("[*] Scan iteration complete. No new unnotified contracts found.")
+        print(f"[+] Scan iteration complete. Processed {new_discoveries} new unique address layouts.")
                     
     except Exception as e:
         print(f"[-] Scan tracking failure: {e}")

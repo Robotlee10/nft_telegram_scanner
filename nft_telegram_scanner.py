@@ -31,63 +31,50 @@ def send_telegram_alert(contract_address, raw_text):
     except Exception as e:
         print(f"[-] Failed to send Telegram message: {e}")
 
-def scan_binance_square_api():
-    """Queries the backend Binance API directly to bypass JavaScript/202 issues."""
-    print("[*] Contacting Binance Square API...")
+def scan_via_mirror():
+    """Pulls feed data using a public RSS-to-JSON bridge to avoid 202 firewall blocks."""
+    print("[*] Reading decentralized feed mirror...")
     
-    # Direct internal API endpoint for hashtag feeds
-    api_url = "https://binance.com"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Content-Type": "application/json",
-        "Lang": "en"
-    }
-    
-    # JSON body structure mimicking what the frontend queries
-    payload = {
-        "hashtag": "agentid",
-        "page": 1,
-        "pageSize": 20,
-        "sortType": 2  # 2 usually sorts by 'Latest/Newest'
-    }
+    # We use an open RSS bridge format that extracts clean, public Binance Square feed strings
+    rss_url = "https://rss2json.com"
     
     try:
-        response = requests.post(api_url, json=payload, headers=headers, timeout=15)
+        response = requests.get(rss_url, timeout=15)
         
         if response.status_code != 200:
-            print(f"[-] API Error: Status {response.status_code}")
+            print(f"[-] Mirror Feed Failed: Status {response.status_code}")
             return
             
         data = response.json()
-        posts = data.get("data", {}).get("list", [])
+        items = data.get("items", [])
         
-        if not posts:
-            print("[*] Feed connected successfully, but no posts found in this block.")
+        if not items:
+            print("[*] Connected to feed! No new items in this window.")
             return
 
         contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
         
-        for post in posts:
-            # Safely extract text block from the json response
-            post_text = post.get("content", "") or ""
+        for item in items:
+            # Check body text and titles for triggers
+            content = f"{item.get('title', '')} {item.get('description', '')}"
             
-            if "mint" in post_text.lower() or "free" in post_text.lower():
-                match = contract_pattern.search(post_text)
+            # Target AgentID community keyword flags
+            if "agentid" in content.lower() or "mint" in content.lower():
+                match = contract_pattern.search(content)
                 if match:
                     contract_address = match.group(0)
                     
                     if contract_address not in ALREADY_NOTIFIED_CONTRACTS:
                         ALREADY_NOTIFIED_CONTRACTS.add(contract_address)
-                        send_telegram_alert(contract_address, post_text)
+                        send_telegram_alert(contract_address, content)
                         
     except Exception as e:
-        print(f"[-] Scan tracking failure: {e}")
+        print(f"[-] Mirror tracking error: {e}")
 
 if __name__ == "__main__":
-    print("[➔] Starting Binance Agentic ID Free Mint API Scanner.")
+    print("[➔] Starting Alternative Free Mint Scanner.")
     if verify_env_variables():
         print("[➔] Monitoring mode active.")
         while True:
-            scan_binance_square_api()
+            scan_via_mirror()
             time.sleep(SCAN_INTERVAL_SECONDS)

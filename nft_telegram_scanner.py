@@ -2,7 +2,6 @@ import os
 import time
 import re
 import requests
-from bs4 import BeautifulSoup
 
 # SECURE CONFIGURATION
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -32,56 +31,63 @@ def send_telegram_alert(contract_address, raw_text):
     except Exception as e:
         print(f"[-] Failed to send Telegram message: {e}")
 
-def scan_binance_square():
-    target_url = "https://binance.com"
-    print("[*] Fetching Binance Square feed...")
+def scan_binance_square_api():
+    """Queries the backend Binance API directly to bypass JavaScript/202 issues."""
+    print("[*] Contacting Binance Square API...")
     
-    # Create a persistent session to hold headers and simulate a real browser session
-    session = requests.Session()
-    session.headers.update({
+    # Direct internal API endpoint for hashtag feeds
+    api_url = "https://binance.com"
+    
+    headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://google.com",
-        "Cache-Control": "max-age=0"
-    })
+        "Content-Type": "application/json",
+        "Lang": "en"
+    }
+    
+    # JSON body structure mimicking what the frontend queries
+    payload = {
+        "hashtag": "agentid",
+        "page": 1,
+        "pageSize": 20,
+        "sortType": 2  # 2 usually sorts by 'Latest/Newest'
+    }
     
     try:
-        # Using a timeout to prevent the bot from hanging indefinitely
-        response = session.get(target_url, timeout=15)
+        response = requests.post(api_url, json=payload, headers=headers, timeout=15)
         
-        # Diagnostics to pinpoint exactly why it fails in the cloud dashboard logs
         if response.status_code != 200:
-            print(f"[-] Error fetching feed: Status {response.status_code}")
-            if response.status_code == 403:
-                print("[-] Fix Notice: Cloud IP is blocked by Cloudflare/Binance firewall.")
+            print(f"[-] API Error: Status {response.status_code}")
             return
             
-        soup = BeautifulSoup(response.text, 'html.parser')
+        data = response.json()
+        posts = data.get("data", {}).get("list", [])
+        
+        if not posts:
+            print("[*] Feed connected successfully, but no posts found in this block.")
+            return
+
         contract_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
         
-        # Scan broad semantic text nodes
-        for element in soup.find_all(['p', 'span', 'div', 'a']):
-            text_content = element.get_text().strip()
+        for post in posts:
+            # Safely extract text block from the json response
+            post_text = post.get("content", "") or ""
             
-            if "mint" in text_content.lower() or "free" in text_content.lower():
-                match = contract_pattern.search(text_content)
+            if "mint" in post_text.lower() or "free" in post_text.lower():
+                match = contract_pattern.search(post_text)
                 if match:
                     contract_address = match.group(0)
                     
                     if contract_address not in ALREADY_NOTIFIED_CONTRACTS:
                         ALREADY_NOTIFIED_CONTRACTS.add(contract_address)
-                        send_telegram_alert(contract_address, text_content)
+                        send_telegram_alert(contract_address, post_text)
                         
-    except requests.exceptions.Timeout:
-        print("[-] Error fetching feed: Connection timed out.")
     except Exception as e:
-        print(f"[-] Scan error occurred: {e}")
+        print(f"[-] Scan tracking failure: {e}")
 
 if __name__ == "__main__":
-    print("[➔] Starting Binance Agentic ID Free Mint Scanner.")
+    print("[➔] Starting Binance Agentic ID Free Mint API Scanner.")
     if verify_env_variables():
         print("[➔] Monitoring mode active.")
         while True:
-            scan_binance_square()
+            scan_binance_square_api()
             time.sleep(SCAN_INTERVAL_SECONDS)

@@ -7,10 +7,20 @@ import asyncio
 import logging
 import sqlite3
 import httpx
+from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from web3 import AsyncWeb3
 from web3.providers import WebSocketProvider, AsyncHTTPProvider
+
+# ==========================================
+# 1. LOGGING CONFIGURATION & NOISE MUTE
+# ==========================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# Mute noisy third-party HTTP clients to stop log flooding
+for logger_name in ["httpx", "httpcore", "urllib3", "requests"]:
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 # ==========================================
 # CONFIGURATION & HIGH-SPEED RPC POOLS
@@ -76,7 +86,6 @@ ERC1155_INTERFACE_ID = "0xd9b67a26"
 ERC2981_ROYALTY_INTERFACE_ID = "0x2a55205a"
 
 DB_FILE = "agentic_mints.db"
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 w3_http = AsyncWeb3(AsyncHTTPProvider(BSC_HTTP_URL))
 
@@ -93,7 +102,7 @@ def rotate_wss_endpoint() -> str:
     return next_endpoint
 
 # ==========================================
-# ASYNC SUPABASE REST ENGINE
+# ASYNC SUPABASE REST ENGINE WITH CACHE
 # ==========================================
 def get_supabase_headers() -> dict:
     return {
@@ -103,16 +112,25 @@ def get_supabase_headers() -> dict:
         "Prefer": "return=representation"
     }
 
+# Local Cache to prevent repeated network requests for recently queried addresses
+SUPABASE_CACHE: dict[str, dict] = {}
+
 async def fetch_supabase_record(http_client: httpx.AsyncClient, address: str) -> dict | None:
-    """Non-blocking query to fetch contract record from Supabase REST API."""
+    """Non-blocking query to fetch contract record with local in-memory caching."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return None
-    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/notified_contracts?address=eq.{address.lower()}"
+    
+    addr_lower = address.lower()
+    if addr_lower in SUPABASE_CACHE:
+        return SUPABASE_CACHE[addr_lower]
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/notified_contracts?address=eq.{addr_lower}"
     try:
         res = await http_client.get(url, headers=get_supabase_headers(), timeout=5.0)
         if res.status_code == 200:
             data = res.json()
             if data and len(data) > 0:
+                SUPABASE_CACHE[addr_lower] = data[0]
                 return data[0]
     except Exception as e:
         logging.error(f"Supabase GET error for {address}: {e}")
@@ -128,6 +146,8 @@ async def upsert_supabase_record(http_client: httpx.AsyncClient, payload: dict):
     try:
         res = await http_client.post(url, json=payload, headers=headers, timeout=5.0)
         if res.status_code in [200, 201]:
+            # Update local memory cache as well
+            SUPABASE_CACHE[payload.get("address").lower()] = payload
             logging.info(f"Synced contract {payload.get('address')} to Supabase.")
     except Exception as e:
         logging.error(f"Supabase UPSERT error for {payload.get('address')}: {e}")
@@ -454,6 +474,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
     await upsert_supabase_record(http_client, new_payload)
 
     await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)
+
 
 # ==========================================
 # WEBSOCKET EVENT LISTENER

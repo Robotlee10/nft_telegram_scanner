@@ -1,3 +1,5 @@
+print(">>> SCRIPT LAUNCHED SUCCESSFULLY <<<", flush=True)
+
 import os
 import io
 import re

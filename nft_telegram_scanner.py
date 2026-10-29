@@ -281,7 +281,8 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
 
     # CHECK 3: Source Code Verification (Etherscan V2 API for BSC ChainID 56)
     try:
-        url = f"https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address={contract_address}"
+        etherscan_api_key = os.getenv("ETHERSCAN_API_KEY", "YOUR_API_KEY")
+        url = f"https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address={contract_address}&apikey={etherscan_api_key}"
         res = await http_client.get(url, timeout=5.0, follow_redirects=True)
         if res.status_code == 200:
             source_data = res.json().get("result", [{}])[0]

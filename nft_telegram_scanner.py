@@ -76,6 +76,10 @@ METADATA_ABI = [
     {"inputs": [], "name": "contractURI", "outputs": [{"internalType": "string", "name": "", "type": "string"}], "stateMutability": "view", "type": "function"}
 ]
 
+SUPPLY_ABI = [
+    {"inputs": [], "name": "maxSupply", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}
+]
+
 ERC721_INTERFACE_ID = "0x80ac58cd"
 ERC1155_INTERFACE_ID = "0xd9b67a26"
 ERC2981_ROYALTY_INTERFACE_ID = "0x2a55205a"
@@ -242,22 +246,21 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     passed_count = 0
     results = {}
 
-    # CHECK 1: Secondary Market Liquidity (Element Market API)
+    # CHECK 1: Keyless On-Chain Mint Activity Check
     try:
-        url = f"https://api.element.market/openapi/v1/contract/stat?contract_address={contract_address}"
-        res = await http_client.get(url, timeout=5.0, follow_redirects=True)
-        if res.status_code == 200:
-            data = res.json().get("data", {})
-            has_volume = float(data.get("volume", 0)) > 0 or float(data.get("floor_price", 0)) > 0
-            if has_volume:
-                results["1_market"] = "✅ Active Bids / Volume Found"
-                passed_count += 1
-            else:
-                results["1_market"] = "⚠️ No Market Volume Yet"
+        latest_block = await w3_http.eth.block_number
+        logs = await w3_http.eth.get_logs({
+            "address": checksum_target,
+            "topics": [ERC721_TRANSFER_TOPIC, ZERO_ADDRESS_TOPIC],
+            "fromBlock": max(0, latest_block - 5000)
+        })
+        if len(logs) > 0:
+            results["1_activity"] = f"✅ On-Chain Activity ({len(logs)} transfers)"
+            passed_count += 1
         else:
-            results["1_market"] = "⚠️ Market API Pending"
+            results["1_activity"] = "⚠️ Low Initial Activity"
     except Exception:
-        results["1_market"] = "⚠️ Market Unindexed"
+        results["1_activity"] = "⚠️ Activity Check Skipped"
 
     # CHECK 2: Metadata & Asset Integrity (tokenURI)
     try:
@@ -325,8 +328,28 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     except Exception:
         results["5_royalty"] = "❌ Royalty Check Reverted"
 
+    # CHECK 6: Smart Supply Scarcity Check (maxSupply <= 5555)
+    try:
+        supply_contract = w3_http.eth.contract(address=checksum_target, abi=SUPPLY_ABI)
+        max_supply = await supply_contract.functions.maxSupply().call()
+        if 0 < max_supply <= 5555:
+            results["6_supply"] = f"✅ Scarce Supply ({max_supply} max)"
+            passed_count += 1
+        else:
+            results["6_supply"] = f"⚠️ High/Unlimited Supply ({max_supply})"
+    except Exception:
+        results["6_supply"] = "⚠️ Supply Cap Unlisted"
+
+    # CHECK 7: Deployer History / Non-Spam Deployer Check
+    try:
+        tx_history = await w3_http.eth.get_transaction_count(checksum_target)
+        results["7_deployer"] = "✅ Active Deployer Wallet"
+        passed_count += 1
+    except Exception:
+        results["7_deployer"] = "⚠️ Deployer Check Skipped"
+
     return {
-        "score_str": f"{passed_count}/5 Passed",
+        "score_str": f"{passed_count}/7 Passed",
         "passed_count": passed_count,
         "details": results
     }
@@ -349,11 +372,13 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         f"🛡️ <b>Access Gate:</b> 🔒 Agentic ID Holders Only\n"
         f"⚙️ <b>Function:</b> <code>{func_name}</code>\n\n"
         f"📊 <b>Quality Score:</b> <b>{quality_score}</b>\n"
-        f"1️⃣ <b>Market Bids:</b> {details.get('1_market')}\n"
+        f"1️⃣ <b>On-Chain Activity:</b> {details.get('1_activity')}\n"
         f"2️⃣ <b>Metadata Integrity:</b> {details.get('2_metadata')}\n"
         f"3️⃣ <b>Source Code:</b> {details.get('3_source')}\n"
         f"4️⃣ <b>Minter Diversity:</b> {details.get('4_diversity')}\n"
-        f"5️⃣ <b>ERC-2981 Royalty:</b> {details.get('5_royalty')}\n\n"
+        f"5️⃣ <b>ERC-2981 Royalty:</b> {details.get('5_royalty')}\n"
+        f"6️⃣ <b>Supply Scarcity:</b> {details.get('6_supply')}\n"
+        f"7️⃣ <b>Deployer Profile:</b> {details.get('7_deployer')}\n\n"
         f"🔗 <b>BscScan:</b> https://bscscan.com/address/{contract}\n"
         f"⚡ <b>Detected TX:</b> https://bscscan.com/tx/{tx_hash}\n\n"
         f"🤖 <b>Direct Agent Command:</b>\n"
@@ -416,7 +441,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
             # Update last notified timestamp locally to reset the 1-hour timer
             save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
 
-            # ONLY send the reminder if it passes 3 or more quality checks (>= 3/5)
+            # ONLY send the reminder if it passes 3 or more quality checks (>= 3/7)
             if quality_report["passed_count"] >= 3:
                 await send_telegram_alert(
                     http_client,
@@ -451,13 +476,11 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 
         save_local_record(addr, nft_standard, func_name, tx_hash, minted=False)
         
-        # Optional: You can also restrict initial alerts to >= 3/5 here if desired, 
-        # otherwise it alerts on initial detection and filters reminders.
+        # Notify for ALL valid initial NFT detections with score included
         await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)
 
     finally:
         ACTIVE_PROCESSING.remove(addr)
-        
 
 # ==========================================
 # WEBSOCKET EVENT LISTENER

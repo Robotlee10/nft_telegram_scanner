@@ -3,12 +3,10 @@ import io
 import re
 import html
 import json
-import shutil
 import asyncio
 import logging
 import sqlite3
 import httpx
-import qrcode
 from pathlib import Path
 from web3 import AsyncWeb3
 from web3.providers import WebSocketProvider, AsyncHTTPProvider
@@ -30,10 +28,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
 MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET", "0xYourBinanceAgenticWalletAddress")
 CONTROL_WALLET_NO_ID = os.getenv("CONTROL_WALLET_NO_ID", "0x0000000000000000000000000000000000000001")
-
-# Optional CLI Executable Path (if present on server)
-BAW_CLI_CMD = os.getenv("BAW_CLI_CMD", "baw")
-SESSION_FILE = Path(".agentic_session.json")
 
 # Standard On-Chain Topics
 ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -91,11 +85,6 @@ def rotate_wss_endpoint() -> str:
     logging.info(f"Switched active WebSocket RPC to: {next_endpoint}")
     return next_endpoint
 
-def has_cli_binary() -> bool:
-    """Checks if the agent CLI executable exists in the system PATH or local directory."""
-    binary = BAW_CLI_CMD.split()[0]
-    return bool(shutil.which(binary) or Path(binary).exists())
-
 # ==========================================
 # PERSISTENT DATABASE
 # ==========================================
@@ -125,162 +114,6 @@ def mark_as_notified(address: str):
     cursor.execute("INSERT OR IGNORE INTO notified_contracts (address) VALUES (?)", (address.lower(),))
     conn.commit()
     conn.close()
-
-# ==========================================
-# SESSION GUARD & TELEGRAM QR FORWARDER
-# ==========================================
-def is_session_valid() -> bool:
-    if not SESSION_FILE.exists():
-        return False
-    try:
-        with open(SESSION_FILE, "r") as f:
-            data = json.load(f)
-            return data.get("valid", False) or bool(data.get("token"))
-    except Exception:
-        return False
-
-async def send_qr_to_telegram(http_client: httpx.AsyncClient):
-    if not has_cli_binary():
-        logging.info("Agent CLI binary not detected on server. Running in High-Speed Alert Mode.")
-        return
-
-    try:
-        logging.info("Generating Binance Agentic Wallet pairing QR...")
-        cmd_args = BAW_CLI_CMD.split() + ["pair", "--json"]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        out_str = stdout.decode().strip() or stderr.decode().strip()
-
-        pairing_url = ""
-        try:
-            payload = json.loads(out_str)
-            pairing_url = payload.get("pairing_url") or payload.get("qr_url") or ""
-        except Exception:
-            pass
-
-        # Specifically extract app.binance.com/uni-qr links
-        if not pairing_url or "uni-qr" not in pairing_url:
-            url_match = re.search(r"https://app\.binance\.com/uni-qr/[a-zA-Z0-9]+", out_str)
-            if url_match:
-                pairing_url = url_match.group(0)
-
-        if not pairing_url:
-            logging.error(f"Could not extract valid uni-qr link from output: {out_str[:200]}")
-            return
-
-        # Generate QR image in memory from the uni-qr link
-        qr = qrcode.QRCode(version=1, box_size=10, border=4)
-        qr.add_data(pairing_url)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
-
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-
-        caption = (
-            "📱 <b>BINANCE AGENTIC WALLET RE-AUTHENTICATION</b>\n\n"
-            "Scan this QR code in your Binance App to authorize cloud auto-minting.\n\n"
-            f"🔗 <b>Open Binance App:</b> <a href='{pairing_url}'>{pairing_url}</a>"
-        )
-
-        reply_markup = {
-            "inline_keyboard": [[
-                {"text": "🔄 Refresh / Verify Session", "callback_data": "reconnect_session"}
-            ]]
-        }
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        files = {"photo": ("qr.png", buf, "image/png")}
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "caption": caption,
-            "parse_mode": "HTML",
-            "reply_markup": json.dumps(reply_markup)
-        }
-
-        res = await http_client.post(url, data=data, files=files, timeout=15.0)
-        if res.status_code == 200:
-            logging.info(f"Pairing QR successfully sent to Telegram: {pairing_url}")
-    except Exception as e:
-        logging.error(f"Failed generating/sending QR code: {e}")
-
-# ==========================================
-# HEADLESS MCP WORKER EXECUTION BRIDGE
-# ==========================================
-async def verify_tx_receipt(tx_hash: str) -> tuple[bool, str]:
-    try:
-        for _ in range(12):
-            await asyncio.sleep(3)
-            receipt = await w3_http.eth.get_transaction_receipt(tx_hash)
-            if receipt is not None:
-                if receipt.get("status") == 1:
-                    return True, f"Success (Block #{receipt.get('blockNumber')})"
-                else:
-                    return False, "Transaction Reverted On-Chain"
-    except Exception as e:
-        return False, f"Receipt query error: {e}"
-    return False, "Confirmation Timeout"
-
-async def execute_mint_via_agent(http_client: httpx.AsyncClient, contract: str, func_name: str, score_str: str, message_id: int = None):
-    if not has_cli_binary():
-        logging.info(f"Manual alert triggered for {contract}. Copy direct command into Agent runner.")
-        return
-
-    if not is_session_valid():
-        await send_qr_to_telegram(http_client)
-        return
-
-    if message_id:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "message_id": message_id,
-            "text": f"⏳ <b>EXECUTING AGENTIC MINT...</b>\n\nTarget: <code>{contract}</code>\nFunction: <code>{func_name}</code>",
-            "parse_mode": "HTML"
-        }
-        await http_client.post(url, json=payload, timeout=10.0)
-
-    try:
-        cmd = f"{BAW_CLI_CMD} write --contract {contract} --func {func_name} --value 0"
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        out_str = stdout.decode().strip() + stderr.decode().strip()
-
-        tx_match = re.search(r"0x[a-fA-F0-9]{64}", out_str)
-        tx_hash = tx_match.group(0) if tx_match else None
-
-        if tx_hash:
-            confirmed, status_msg = await verify_tx_receipt(tx_hash)
-            status_emoji = "🟢" if confirmed else "🔴"
-
-            result_msg = (
-                f"{status_emoji} <b>TRANSACTION {'SUCCESS' if confirmed else 'FAILED'}</b>\n\n"
-                f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
-                f"📊 <b>Quality Score:</b> {score_str}\n"
-                f"⚡ <b>Status:</b> {status_msg}\n"
-                f"🔗 <b>BscScan TX:</b> https://bscscan.com/tx/{tx_hash}"
-            )
-        else:
-            result_msg = (
-                f"❌ <b>MINT EXECUTION ERROR</b>\n\n"
-                f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
-                f"⚠️ <b>CLI Output:</b> <pre>{html.escape(out_str[:300])}</pre>"
-            )
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        await http_client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": result_msg, "parse_mode": "HTML"}, timeout=10.0)
-
-    except Exception as e:
-        logging.error(f"Execution error for {contract}: {e}")
 
 # ==========================================
 # ON-CHAIN CHECKS MODULE
@@ -459,22 +292,16 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     }
 
 # ==========================================
-# ALERT SENDER WITH INLINE KEYBOARDS
+# ALERT SENDER
 # ==========================================
-async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict, auto_minted: bool):
+async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict):
     agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB. execute it, if it preview clearly and would return a ERC-721 token"
 
     details = quality_report["details"]
     quality_score = quality_report["score_str"]
 
-    if has_cli_binary():
-        status_header = "⚡ <b>AUTO-MINT EXECUTED (Score ≥ 3/5)</b>" if auto_minted else "⚠️ <b>APPROVAL REQUIRED (Score < 3/5)</b>"
-    else:
-        status_header = f"🚨 <b>EXCLUSIVE MINT DETECTED (Score: {quality_score})</b>"
-
     message = (
         f"🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨\n\n"
-        f"📌 <b>Execution Status:</b> {status_header}\n"
         f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
         f"🎨 <b>NFT Standard:</b> ✅ {nft_standard}\n"
         f"🛡️ <b>Access Gate:</b> 🔒 Agentic ID Holders Only\n"
@@ -497,13 +324,6 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-
-    if has_cli_binary() and not auto_minted:
-        payload["reply_markup"] = json.dumps({
-            "inline_keyboard": [[
-                {"text": "⚡ Approve & Mint Now", "callback_data": f"mint:{contract}:{func_name}:{quality_score}"}
-            ]]
-        })
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
@@ -537,53 +357,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 
     mark_as_notified(contract_address)
     quality_report = await run_quality_checks(http_client, contract_address)
-    passed_count = quality_report["passed_count"]
-
-    if has_cli_binary() and passed_count >= 3:
-        await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report, auto_minted=True)
-        asyncio.create_task(execute_mint_via_agent(http_client, contract_address, func_name, quality_report["score_str"]))
-    else:
-        await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report, auto_minted=False)
-
-# ==========================================
-# TELEGRAM CALLBACK POLLING ENGINE
-# ==========================================
-async def telegram_polling_loop(http_client: httpx.AsyncClient):
-    offset = 0
-    logging.info("Telegram callback polling engine started...")
-
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
-            res = await http_client.get(url, timeout=25.0)
-
-            if res.status_code == 200:
-                updates = res.json().get("result", [])
-                for update in updates:
-                    offset = update["update_id"] + 1
-
-                    if "callback_query" in update:
-                        cb = update["callback_query"]
-                        cb_id = cb["id"]
-                        cb_data = cb.get("data", "")
-                        message_id = cb.get("message", {}).get("message_id")
-
-                        await http_client.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                            json={"callback_query_id": cb_id}
-                        )
-
-                        if cb_data.startswith("mint:"):
-                            _, contract, func_name, score_str = cb_data.split(":", 3)
-                            asyncio.create_task(execute_mint_via_agent(http_client, contract, func_name, score_str, message_id))
-                        
-                        elif cb_data == "reconnect_session":
-                            asyncio.create_task(send_qr_to_telegram(http_client))
-
-        except Exception as e:
-            logging.debug(f"Polling loop exception: {e}")
-
-        await asyncio.sleep(1)
+    await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report)
 
 # ==========================================
 # WEBSOCKET EVENT LISTENER
@@ -602,11 +376,6 @@ async def listen_onchain(wss_url: str):
     )
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
-        asyncio.create_task(telegram_polling_loop(http_client))
-
-        if not is_session_valid():
-            await send_qr_to_telegram(http_client)
-
         async with AsyncWeb3(ws_provider) as w3_ws:
             logging.info(f"Connected to {wss_url}. Streaming mint logs...")
 
@@ -647,3 +416,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+        

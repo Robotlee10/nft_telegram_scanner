@@ -373,9 +373,10 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
             logging.info(f"Alert sent for contract: {contract} (Reminder: {is_reminder})")
     except Exception as e:
         logging.error(f"Failed sending alert: {e}")
+)
 
 # ==========================================
-# PIPELINE WITH LOCAL CACHE & LOCKING
+# PIPELINE WITH LOCAL CACHE & QUALITY FILTER FOR REMINDERS
 # ==========================================
 ACTIVE_PROCESSING = set()
 
@@ -409,21 +410,25 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
                     logging.debug(f"Timestamp parse error: {e}")
                     return
 
-            # Passed 1 hour without being minted -> Trigger Re-Notification Alert!
+            # Passed 1 hour without being minted -> Run quality checks again
             quality_report = await run_quality_checks(http_client, addr)
             
-            # Update last notified timestamp locally
+            # Update last notified timestamp locally to reset the 1-hour timer
             save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
 
-            await send_telegram_alert(
-                http_client,
-                contract=addr,
-                nft_standard=record["nft_standard"],
-                func_name=record["function_name"],
-                tx_hash=tx_hash,
-                quality_report=quality_report,
-                is_reminder=True
-            )
+            # ONLY send the reminder if it passes 3 or more quality checks (>= 3/5)
+            if quality_report["passed_count"] >= 3:
+                await send_telegram_alert(
+                    http_client,
+                    contract=addr,
+                    nft_standard=record["nft_standard"],
+                    func_name=record["function_name"],
+                    tx_hash=tx_hash,
+                    quality_report=quality_report,
+                    is_reminder=True
+                )
+            else:
+                logging.info(f"Skipped 1-hour reminder for {addr}: Quality score dropped ({quality_report['score_str']})")
             return
 
         # 2. Candidate is NEW -> Save placeholder immediately to prevent concurrent duplicates
@@ -445,10 +450,14 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         quality_report = await run_quality_checks(http_client, addr)
 
         save_local_record(addr, nft_standard, func_name, tx_hash, minted=False)
+        
+        # Optional: You can also restrict initial alerts to >= 3/5 here if desired, 
+        # otherwise it alerts on initial detection and filters reminders.
         await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)
 
     finally:
         ACTIVE_PROCESSING.remove(addr)
+        
 
 # ==========================================
 # WEBSOCKET EVENT LISTENER

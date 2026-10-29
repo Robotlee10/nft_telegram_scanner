@@ -511,8 +511,8 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
             # Update last notified timestamp locally to reset the 1-hour timer
             save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
 
-            # ONLY send the reminder if it passes 3 or more quality checks (>= 3/7)
-            if quality_report["passed_count"] >= 3:
+            # ONLY send the reminder if it passes 5 or more quality checks (>= 5/7)
+            if quality_report["passed_count"] >= 5:
                 queue_auto_mint(addr, record["function_name"], quality_report["passed_count"])
                 await send_telegram_alert(
                     http_client,

@@ -1,51 +1,40 @@
 import os
-import re
 import html
 import asyncio
 import logging
 import sqlite3
 import httpx
-from tavily import AsyncTavilyClient
 from web3 import AsyncWeb3
-from web3.providers import AsyncHTTPProvider
+from web3.providers import WebSocketProvider
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "YOUR_TAVILY_KEY")
+# Free BSC WebSocket Nodes (No API key needed)
+BSC_WSS_URL = os.getenv("BSC_WSS_URL", "wss://bsc-rpc.publicnode.com")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed1.binance.org/")
 
-# Your Binance Agentic Wallet Address (used to simulate eligibility)
-AGENTIC_WALLET_ADDRESS = os.getenv("AGENTIC_WALLET_ADDRESS", "0xD0833B61A69e69FA31B02F877336d33d5B7fB169")
+# Your Binance Agentic Wallet Address
+MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET", "0xD0833B61A69e69FA31B02F877336d33d5B7fB169")
 
-CHECK_INTERVAL_SECONDS = 600  # Check every 3 minutes
-DB_FILE = "agentic_mints.db"
+# Standard ERC-721 Transfer Event Hash: keccak256("Transfer(address,address,uint256)")
+ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+ZERO_ADDRESS_TOPIC = "0x0000000000000000000000000000000000000000000000000000000000000000"
 
-# Highly targeted queries matching Agentic Wallet post patterns
-SEARCH_QUERIES = [
-    '"Use my Binance Agentic Wallet" "contract"',
-    '".ai Agent ID" "free" "0x"',
-    'site:binance.com/square "Agentic Wallet" "mint" "0x"',
-    'site:x.com "Binance Agentic Wallet" "free mint" "0x"'
+# Common Agentic Mint Function Selectors
+MINT_FUNCTIONS = [
+    {"name": "mint(1)", "data": "a0712d680000000000000000000000000000000000000000000000000000000000000001"},
+    {"name": "freeMint()", "data": "0x438d1d8f"},
+    {"name": "claim()", "data": "0x4e71d92d"}
 ]
 
+DB_FILE = "agentic_mints.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Web3 Initialization
-w3 = AsyncWeb3(AsyncHTTPProvider(BSC_RPC_URL))
-
-# Common Agentic Mint Function Selectors (first 4 bytes of keccak256)
-MINT_FUNCTIONS = [
-    {"name": "mint(uint256)", "data": "a0712d680000000000000000000000000000000000000000000000000000000000000001"},  # mint(1)
-    {"name": "freeMint()", "data": "0x438d1d8f"},                                                               # freeMint()
-    {"name": "claim()", "data": "0x4e71d92d"},                                                                  # claim()
-    {"name": "mint(uint256)", "data": "a0712d680000000000000000000000000000000000000000000000000000000000000000"}   # mint(0)
-]
-
 # ==========================================
-# PERSISTENT DATABASE (SQLite)
+# PERSISTENT STORAGE
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -75,15 +64,15 @@ def mark_as_notified(address: str):
     conn.close()
 
 # ==========================================
-# ON-CHAIN 0 BNB SIMULATION ENGINE
+# ON-CHAIN SIMULATION (0 BNB FREE CHECK)
 # ==========================================
-async def simulate_zero_value_mint(contract_address: str) -> tuple[bool, str, str]:
+async def verify_agentic_free_mint(w3: AsyncWeb3, contract_address: str) -> tuple[bool, str]:
     """
-    Simulates a call to the contract with value = 0 BNB using your Agentic Wallet.
-    If the call reverts, it means paid mint required, sold out, or not eligible.
+    Simulates calling mint on the target contract with value=0 BNB 
+    from YOUR Agentic Wallet to confirm instant eligibility.
     """
     checksum_target = w3.to_checksum_address(contract_address)
-    checksum_wallet = w3.to_checksum_address(AGENTIC_WALLET_ADDRESS)
+    checksum_wallet = w3.to_checksum_address(MY_AGENTIC_WALLET)
 
     for fn in MINT_FUNCTIONS:
         try:
@@ -93,37 +82,31 @@ async def simulate_zero_value_mint(contract_address: str) -> tuple[bool, str, st
                 "value": 0,  # Enforce 0 BNB
                 "data": fn["data"]
             }
-            
-            # Simulate transaction execution on-chain
+            # Execute read-only simulation
             await w3.eth.call(tx_payload)
             
-            # If call doesn't revert, 0 BNB mint IS ACTIVE AND VALID!
-            return True, fn["name"], "0 BNB Free Mint Verified On-Chain"
+            # Call succeeded without revert -> Guaranteed Free Mint!
+            return True, fn["name"]
+        except Exception:
+            continue
 
-        except Exception as e:
-            err_msg = str(e).lower()
-            if "insufficient funds" in err_msg or "execution reverted" in err_msg:
-                continue
-
-    return False, "None", "Simulation failed: Requires BNB, Sold Out, or Ineligible."
+    return False, "None"
 
 # ==========================================
 # TELEGRAM ALERT SENDER
 # ==========================================
-async def send_telegram_alert(client: httpx.AsyncClient, contract: str, source: str, snippet: str, link: str, func_used: str):
-    """Sends alert with pre-tested command payload."""
-    clean_snippet = html.escape(snippet[:300])
-    agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_used} on BNB Chain at contract address {contract} with value 0 BNB."
+async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, func_name: str, tx_hash: str):
+    """Sends structured alert with exact agent prompt."""
+    agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB."
 
     message = (
-        f"🚨 <b>VERIFIED AGENTIC FREE MINT DETECTED</b> 🚨\n\n"
-        f"📍 <b>Source:</b> {html.escape(source)}\n"
+        f"🚨 <b>REAL-TIME AGENTIC FREE MINT DETECTED</b> 🚨\n\n"
+        f"📍 <b>Source:</b> Direct BSC WebSocket On-Chain Event\n"
         f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
-        f"🧪 <b>On-Chain Sim Status:</b> 🟢 0 BNB Call Succeeded\n"
-        f"⚙️ <b>Verified Function:</b> <code>{func_used}</code>\n"
+        f"🧪 <b>Sim Status:</b> 🟢 0 BNB Call Verified\n"
+        f"⚙️ <b>Function:</b> <code>{func_name}</code>\n"
         f"🔗 <b>BscScan:</b> https://bscscan.com/address/{contract}\n"
-        f"🌐 <b>Post Link:</b> {link}\n\n"
-        f"📝 <b>Context Snippet:</b>\n<i>{clean_snippet}...</i>\n\n"
+        f"⚡ <b>Detected TX:</b> https://bscscan.com/tx/{tx_hash}\n\n"
         f"🤖 <b>Direct Agent Command:</b>\n"
         f"<pre><code>{agent_command}</code></pre>"
     )
@@ -137,70 +120,63 @@ async def send_telegram_alert(client: httpx.AsyncClient, contract: str, source: 
     }
     
     try:
-        res = await client.post(url, json=payload, timeout=10.0)
-        if res.status_code != 200:
-            logging.error(f"Telegram API Error ({res.status_code}): {res.text}")
+        res = await http_client.post(url, json=payload, timeout=10.0)
+        if res.status_code == 200:
+            logging.info(f"Alert sent for contract: {contract}")
     except Exception as e:
-        logging.error(f"Failed sending alert: {e}")
+        logging.error(f"Failed sending Telegram alert: {e}")
 
 # ==========================================
-# MAIN SCANNING LOOP
+# WEBSOCKET ON-CHAIN LISTENER
 # ==========================================
-async def scan_and_verify(tavily_client: AsyncTavilyClient, http_client: httpx.AsyncClient):
-    for query in SEARCH_QUERIES:
-        try:
-            response = await tavily_client.search(
-                query=query, 
-                search_depth="advanced", 
-                time_range="day"
-            )
-            
-            for item in response.get("results", []):
-                snippet = item.get("content", "")
-                full_text = f"{item.get('title', '')} {snippet}"
-                url = item.get("url", "")
-                
-                # Extract EVM contract addresses
-                found_contracts = re.findall(r"0x[a-fA-F0-9]{40}", full_text)
-                for addr in set(found_contracts):
-                    addr_lower = addr.lower()
-                    
-                    if is_already_notified(addr_lower):
-                        continue
-                    
-                    # SIMULATE ON-CHAIN BEFORE ALERTING
-                    is_free, func_used, sim_status = await simulate_zero_value_mint(addr_lower)
-                    
-                    if is_free:
-                        mark_as_notified(addr_lower)
-                        await send_telegram_alert(
-                            http_client,
-                            addr,
-                            f"Agentic Feed Index ({url})",
-                            snippet,
-                            url,
-                            func_used
-                        )
-                    else:
-                        logging.info(f"Skipped {addr}: {sim_status}")
-
-        except Exception as e:
-            logging.error(f"Search query error: {e}")
-
-async def main():
+async def listen_onchain():
     init_db()
-    logging.info("Starting Verified Agentic Free Mint Scanner...")
-
-    tavily_client = AsyncTavilyClient(api_key=TAVILY_API_KEY)
+    logging.info("Connecting to BSC WebSocket Node...")
 
     async with httpx.AsyncClient() as http_client:
-        while True:
-            try:
-                await scan_and_verify(tavily_client, http_client)
-            except Exception as e:
-                logging.error(f"Main loop exception: {e}")
-            
-            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+        async with AsyncWeb3(WebSocketProvider(BSC_WSS_URL)) as w3:
+            logging.info("Connected to BSC. Listening for real-time NFT mint events...")
+
+            # Subscribe to Transfer logs where from = 0x0000...0000 (Mints)
+            subscription_id = await w3.eth.subscribe(
+                "logs",
+                {
+                    "topics": [
+                        ERC721_TRANSFER_TOPIC,
+                        ZERO_ADDRESS_TOPIC
+                    ]
+                }
+            )
+
+            async for log in w3.socket.process_subscriptions():
+                try:
+                    result = log.get("result", {})
+                    contract_address = result.get("address", "").lower()
+                    tx_hash = result.get("transactionHash", "").hex()
+
+                    if not contract_address or is_already_notified(contract_address):
+                        continue
+
+                    # Simulate 0 BNB mint for your Agentic Wallet
+                    is_eligible, func_name = await verify_agentic_free_mint(w3, contract_address)
+                    
+                    if is_eligible:
+                        mark_as_notified(contract_address)
+                        await send_telegram_alert(http_client, contract_address, func_name, tx_hash)
+
+                except Exception as e:
+                    logging.error(f"Error processing event log: {e}")
+
+# ==========================================
+# MAIN EXECUTION WITH AUTO-RECONNECT
+# ==========================================
+async def main():
+    while True:
+        try:
+            await listen_onchain()
+        except Exception as e:
+            logging.error(f"WebSocket connection dropped ({e}). Reconnecting in 5 seconds...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())

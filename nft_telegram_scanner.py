@@ -411,11 +411,17 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     except Exception:
         results["6_supply"] = "⚠️ Supply Cap Unlisted"
 
-    # CHECK 7: Deployer History / Non-Spam Deployer Check
+      # CHECK 7: True Deployer History & Track Record Check (Fixed)
     try:
-        tx_history = await w3_http.eth.get_transaction_count(checksum_target)
-        results["7_deployer"] = "✅ Active Deployer Wallet"
-        passed_count += 1
+        tx_receipt = await w3_http.eth.get_transaction_receipt(tx_hash)
+        deployer_address = tx_receipt["from"]
+        deployer_nonce = await w3_http.eth.get_transaction_count(deployer_address)
+        
+        if deployer_nonce > 3:
+            results["7_deployer"] = f"✅ Experienced Team ({deployer_nonce} history txs)"
+            passed_count += 1
+        else:
+            results["7_deployer"] = f"⚠️ Low-History Deployer Wallet ({deployer_nonce} txs)"
     except Exception:
         results["7_deployer"] = "⚠️ Deployer Check Skipped"
 

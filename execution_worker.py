@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-execution_worker.py - Standalone Microservice Execution Worker (Pure Python 3.12)
+execution_worker.py - Standalone Microservice Execution Worker (Render Environment)
 Network: BNB Chain (BSC Mainnet - Chain ID 56)
-Environment: Pterodactyl / Docker on bot-hosting.net (No Node.js / CLI required)
+Environment: Python 3.12 + Node.js (baw CLI bridge)
 
 Features:
- 1. Direct Binance Agentic API & Web3 Transaction Dispatcher
+ 1. Official Binance Agentic Wallet CLI (`baw`) bridge integration
  2. Telegram Callback Query Listener (getUpdates long polling for manual approvals)
- 3. Auto-Mint DB Poller for high quality scores (>= 3/5)
+ 3. Auto-Mint DB Poller for high quality scores (>= 3/5) from agentic_mints.db
  4. On-Chain Verification via BSC RPC (36s timeout) & Telegram feedback
 """
 
@@ -18,7 +18,8 @@ import time
 import asyncio
 import sqlite3
 import logging
-from typing import Optional, Dict, Any, Tuple
+import subprocess
+from typing import Optional, Tuple
 
 import httpx
 from web3 import Web3
@@ -32,7 +33,6 @@ MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET")
 BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-dataseed1.binance.org/")
 
 DB_FILE = "agentic_mints.db"
-SESSION_FILE = ".agentic_session.json"
 BSC_CHAIN_ID = 56
 AUTO_MINT_THRESHOLD = 3  # Score >= 3 triggers automated minting
 RPC_RECEIPT_TIMEOUT = 36 # Seconds to poll for transaction receipt
@@ -90,28 +90,6 @@ def get_db_connection():
     return conn
 
 # ==========================================
-# SESSION & WALLET STATE MANAGER
-# ==========================================
-class AgenticSessionManager:
-    """Manages session tokens loaded from .agentic_session.json."""
-    def __init__(self, filepath: str = SESSION_FILE):
-        self.filepath = filepath
-        self.token = ""
-        self.load_session()
-
-    def load_session(self):
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r") as f:
-                    data = json.load(f)
-                    self.token = data.get("token", "")
-                logger.info("Loaded Agentic session token from disk.")
-            except Exception as e:
-                logger.error(f"Failed to load session file: {e}")
-
-session_mgr = AgenticSessionManager()
-
-# ==========================================
 # TELEGRAM BOT & NOTIFICATION SERVICE
 # ==========================================
 class TelegramService:
@@ -156,39 +134,50 @@ class TelegramService:
 telegram_service = TelegramService(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 # ==========================================
-# TRANSACTION EXECUTION PIPELINE
+# TRANSACTION EXECUTION VIA OFFICIAL `baw` CLI
 # ==========================================
 async def execute_agentic_mint(contract_address: str, function_name: str, trigger_source: str = "AUTO") -> Tuple[bool, str]:
     """
-    Executes transaction call using the configured Agentic Wallet configuration via Python async HTTP.
+    Submits transaction via the official Binance Agentic Wallet CLI (`baw`) 
+    and handles on-chain verification.
     """
-    logger.info(f"[{trigger_source}] Submitting mint execution: Contract={contract_address}, Function={function_name}")
+    logger.info(f"[{trigger_source}] Invoking baw CLI for mint: Contract={contract_address}, Function={function_name}")
 
-    payload = {
-        "wallet": MY_AGENTIC_WALLET,
-        "chain_id": BSC_CHAIN_ID,
-        "to": contract_address,
-        "function": function_name,
-        "value": "0",
-        "token": session_mgr.token
-    }
+    # Official Binance Agentic Wallet CLI command structure for contract calls
+    cmd = [
+        "baw", "contract-call", "execute",
+        "--to", contract_address,
+        "--function", function_name,
+        "--chain", str(BSC_CHAIN_ID),
+        "--json"
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            # Secure execution gateway endpoint
-            response = await client.post("https://api.binance.com/api/v3/agentic/wallet/execute", json=payload)
-            
-            if response.status_code == 200:
-                res_data = response.json()
-                tx_hash = res_data.get("tx_hash") or res_data.get("hash")
-            else:
-                # Fallback / simulation handle if API route requires specific header wrapper
-                tx_hash = f"0x{os.urandom(32).hex()}"
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            err_msg = stderr.decode().strip() or stdout.decode().strip() or "Unknown CLI error"
+            logger.error(f"baw CLI execution failed: {err_msg}")
+            return False, err_msg
+
+        output_raw = stdout.decode().strip()
+        logger.info(f"CLI Raw Output: {output_raw}")
+
+        try:
+            res_data = json.loads(output_raw)
+            tx_hash = res_data.get("tx_hash") or res_data.get("hash") or res_data.get("result")
+        except Exception:
+            tx_hash = output_raw if output_raw.startswith("0x") else None
 
         if not tx_hash:
-            return False, "Failed to resolve transaction hash."
+            return False, f"CLI output did not contain valid tx_hash: {output_raw}"
 
-        # Broadcast update to Telegram
+        # Broadcast notification to Telegram
         await telegram_service.send_message(
             f"🚀 <b>Mint Transaction Broadcasted!</b>\n\n"
             f"<b>Contract:</b> <code>{contract_address}</code>\n"
@@ -198,7 +187,7 @@ async def execute_agentic_mint(contract_address: str, function_name: str, trigge
             f"⏳ Polling BSC RPC for receipt (Timeout: {RPC_RECEIPT_TIMEOUT}s)..."
         )
 
-        # Verify transaction on-chain via Web3
+        # Poll BSC RPC for transaction receipt
         receipt_success, block_num, err_detail = await verify_tx_on_chain(tx_hash)
 
         if receipt_success:
@@ -222,7 +211,7 @@ async def execute_agentic_mint(contract_address: str, function_name: str, trigge
             return False, err_detail
 
     except Exception as e:
-        logger.error(f"Error during execution request: {e}")
+        logger.error(f"Exception during baw CLI subprocess execution: {e}")
         return False, str(e)
 
 
@@ -349,7 +338,7 @@ async def poll_telegram_updates():
                                 func_name = parts[2]
                                 score = parts[3] if len(parts) > 3 else "N/A"
 
-                                await telegram_service.answer_callback(cq_id, "⚡ Initiating Mint Execution...")
+                                await telegram_service.answer_callback(cq_id, "⚡ Initiating Mint Execution via baw...")
                                 
                                 asyncio.create_task(
                                     execute_agentic_mint(contract, func_name, trigger_source=f"MANUAL TAP (Score: {score})")
@@ -366,7 +355,7 @@ async def poll_telegram_updates():
 # ==========================================
 async def main():
     logger.info("==================================================")
-    logger.info(" Starting Pure Python Agentic Execution Worker  ")
+    logger.info(" Starting Render Agentic Execution Worker (baw CLI)")
     logger.info("==================================================")
 
     init_db()
@@ -381,4 +370,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Worker stopped gracefully.")
-                     
+ 

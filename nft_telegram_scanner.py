@@ -30,7 +30,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET", "0xYourBinanceAgenticWalletAddress")
 CONTROL_WALLET_NO_ID = os.getenv("CONTROL_WALLET_NO_ID", "0x0000000000000000000000000000000000000001")
 
-# Headless Agentic CLI Command & Session Configuration
+# CLI Command / Path for Headless Agent Worker
 BAW_CLI_CMD = os.getenv("BAW_CLI_CMD", "baw")
 SESSION_FILE = Path(".agentic_session.json")
 
@@ -124,7 +124,7 @@ def mark_as_notified(address: str):
 # SESSION GUARD & TELEGRAM QR FORWARDER
 # ==========================================
 def is_session_valid() -> bool:
-    """Verifies if the local Binance Agentic Wallet session file exists and is active."""
+    """Verifies if the local session file exists and is populated."""
     if not SESSION_FILE.exists():
         return False
     try:
@@ -135,11 +135,12 @@ def is_session_valid() -> bool:
         return False
 
 async def send_qr_to_telegram(http_client: httpx.AsyncClient):
-    """Generates a pairing QR code via headless CLI and sends it directly to Telegram."""
+    """Generates a pairing QR code via CLI and sends it directly to Telegram."""
     try:
         logging.info("Generating Binance Agentic Wallet pairing QR...")
+        cmd_args = BAW_CLI_CMD.split() + ["pair", "--json"]
         proc = await asyncio.create_subprocess_exec(
-            *BAW_CLI_CMD.split(), "pair", "--json",
+            *cmd_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -154,7 +155,7 @@ async def send_qr_to_telegram(http_client: httpx.AsyncClient):
             url_match = re.search(r"https?://[^\s]+", out_str)
             pairing_url = url_match.group(0) if url_match else "https://agentic.binance.com/pair"
 
-        # Generate QR code in memory
+        # Generate QR image in memory
         qr = qrcode.QRCode(version=1, box_size=10, border=4)
         qr.add_data(pairing_url)
         qr.make(fit=True)
@@ -188,6 +189,11 @@ async def send_qr_to_telegram(http_client: httpx.AsyncClient):
         res = await http_client.post(url, data=data, files=files, timeout=15.0)
         if res.status_code == 200:
             logging.info("Pairing QR successfully sent to Telegram.")
+    except FileNotFoundError:
+        err_msg = f"⚠️ <b>CLI NOT FOUND:</b> Binary <code>{BAW_CLI_CMD}</code> is not in container PATH. Please configure BAW_CLI_CMD env var."
+        logging.error(err_msg)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        await http_client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": err_msg, "parse_mode": "HTML"})
     except Exception as e:
         logging.error(f"Failed generating/sending QR code: {e}")
 
@@ -215,7 +221,6 @@ async def execute_mint_via_agent(http_client: httpx.AsyncClient, contract: str, 
         await send_qr_to_telegram(http_client)
         return
 
-    # Update message state if triggered via Telegram button
     if message_id:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
         payload = {
@@ -244,7 +249,7 @@ async def execute_mint_via_agent(http_client: httpx.AsyncClient, contract: str, 
             status_emoji = "🟢" if confirmed else "🔴"
 
             result_msg = (
-                f"{status_emoji} <b>TRANSACTION { 'SUCCESS' if confirmed else 'FAILED' }</b>\n\n"
+                f"{status_emoji} <b>TRANSACTION {'SUCCESS' if confirmed else 'FAILED'}</b>\n\n"
                 f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
                 f"📊 <b>Quality Score:</b> {score_str}\n"
                 f"⚡ <b>Status:</b> {status_msg}\n"
@@ -254,7 +259,7 @@ async def execute_mint_via_agent(http_client: httpx.AsyncClient, contract: str, 
             result_msg = (
                 f"❌ <b>MINT EXECUTION ERROR</b>\n\n"
                 f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
-                f"⚠️ <b>Cli Output:</b> <pre>{html.escape(out_str[:300])}</pre>"
+                f"⚠️ <b>CLI Output:</b> <pre>{html.escape(out_str[:300])}</pre>"
             )
 
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -266,7 +271,40 @@ async def execute_mint_via_agent(http_client: httpx.AsyncClient, contract: str, 
 # ==========================================
 # ON-CHAIN CHECKS MODULE
 # ==========================================
+async def verify_is_nft_contract(contract_address: str) -> tuple[bool, str]:
+    """Ensures contract is strictly an ERC-721 or ERC-1155 standard NFT."""
+    checksum_target = w3_http.to_checksum_address(contract_address)
+    
+    try:
+        code = await w3_http.eth.get_code(checksum_target)
+        if not code or len(code) <= 2:
+            return False, "Not a contract"
+
+        code_hex = code.hex()
+        contract_obj = w3_http.eth.contract(address=checksum_target, abi=ERC165_ABI)
+
+        try:
+            if await contract_obj.functions.supportsInterface(bytes.fromhex(ERC721_INTERFACE_ID[2:])).call():
+                return True, "ERC-721"
+        except Exception:
+            pass
+
+        try:
+            if await contract_obj.functions.supportsInterface(bytes.fromhex(ERC1155_INTERFACE_ID[2:])).call():
+                return True, "ERC-1155"
+        except Exception:
+            pass
+
+        if "63706577" in code_hex or "70a08231" in code_hex:
+            return True, "ERC-721 (Bytecode Verified)"
+
+    except Exception as e:
+        logging.debug(f"NFT check failed for {contract_address}: {e}")
+
+    return False, "Non-NFT"
+
 async def already_owns_nft(contract_address: str) -> bool:
+    """Checks on-chain if MY_AGENTIC_WALLET already holds balance in verified NFT contract."""
     try:
         checksum_target = w3_http.to_checksum_address(contract_address)
         checksum_wallet = w3_http.to_checksum_address(MY_AGENTIC_WALLET)
@@ -274,7 +312,8 @@ async def already_owns_nft(contract_address: str) -> bool:
         contract = w3_http.eth.contract(address=checksum_target, abi=BALANCE_ABI)
         balance = await contract.functions.balanceOf(checksum_wallet).call()
         
-        if balance > 0:
+        # Enforce reasonable NFT token balance check (< 1,000,000 to avoid ERC-20 decimal skew)
+        if 0 < balance < 1000000:
             logging.info(f"Skipped {contract_address}: Wallet already holds {balance} NFT(s).")
             return True
     except Exception as e:
@@ -312,37 +351,6 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
             return True, fn["name"], "EXCLUSIVE Agentic Free Mint Confirmed!"
 
     return False, "None", "Failed simulation or public mint."
-
-async def verify_is_nft_contract(contract_address: str) -> tuple[bool, str]:
-    checksum_target = w3_http.to_checksum_address(contract_address)
-    
-    try:
-        code = await w3_http.eth.get_code(checksum_target)
-        if not code or len(code) <= 2:
-            return False, "Not a contract"
-
-        code_hex = code.hex()
-        contract_obj = w3_http.eth.contract(address=checksum_target, abi=ERC165_ABI)
-
-        try:
-            if await contract_obj.functions.supportsInterface(bytes.fromhex(ERC721_INTERFACE_ID[2:])).call():
-                return True, "ERC-721"
-        except Exception:
-            pass
-
-        try:
-            if await contract_obj.functions.supportsInterface(bytes.fromhex(ERC1155_INTERFACE_ID[2:])).call():
-                return True, "ERC-1155"
-        except Exception:
-            pass
-
-        if "63706577" in code_hex or "70a08231" in code_hex:
-            return True, "ERC-721 (Bytecode Verified)"
-
-    except Exception as e:
-        logging.debug(f"NFT check failed for {contract_address}: {e}")
-
-    return False, "Non-NFT"
 
 async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: str) -> dict:
     checksum_target = w3_http.to_checksum_address(contract_address)
@@ -436,7 +444,6 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
         "passed_count": passed_count,
         "details": results
     }
-
 # ==========================================
 # ALERT SENDER WITH INLINE KEYBOARDS
 # ==========================================
@@ -474,7 +481,6 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         "disable_web_page_preview": True
     }
 
-    # Attach manual approval button if score < 3/5
     if not auto_minted:
         payload["reply_markup"] = json.dumps({
             "inline_keyboard": [[
@@ -491,34 +497,40 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         logging.error(f"Failed sending alert: {e}")
 
 # ==========================================
-# STRICT WORKER PIPELINE WITH SCORE ROUTING
+# STRICT SEQUENTIAL WORKER PIPELINE
 # ==========================================
 async def process_contract_candidate(http_client: httpx.AsyncClient, contract_address: str, tx_hash: str):
+    """
+    STRICT CHECK SEQUENCE:
+    0. DB Deduplication Check
+    1. NFT Standard Test (Must be ERC-721 or ERC-1155) -> Drops BEP-20 tokens
+    2. Ownership Check (Must NOT already hold balance in wallet)
+    3. Exclusivity Test (Must be 0 BNB strictly for Agentic ID holders)
+    4. Quality Scoring & Execution Routing
+    """
     if is_already_notified(contract_address):
         return
 
-    # 1. Ownership check
-    if await already_owns_nft(contract_address):
-        mark_as_notified(contract_address)
-        return
-
-    # 2. Exclusivity simulation
-    is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(contract_address)
-    if not is_exclusive:
-        return
-
-    # 3. NFT Standard validation
+    # 1. FIRST CHECK: Confirm contract is strictly ERC-721 / ERC-1155
     is_nft, nft_standard = await verify_is_nft_contract(contract_address)
     if not is_nft:
         return
 
+    # 2. SECOND CHECK: Do I already own this NFT?
+    if await already_owns_nft(contract_address):
+        mark_as_notified(contract_address)
+        return
+
+    # 3. THIRD CHECK: Is it free strictly for Agentic ID holders?
+    is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(contract_address)
+    if not is_exclusive:
+        return
+
+    # Passed 1, 2, 3 -> Mark DB, score, and route
     mark_as_notified(contract_address)
     quality_report = await run_quality_checks(http_client, contract_address)
     passed_count = quality_report["passed_count"]
 
-    # SCORE ROUTING LOGIC:
-    # Score >= 3/5 -> Auto-Mint
-    # Score < 3/5  -> Manual Approval via Telegram Button
     if passed_count >= 3:
         await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report, auto_minted=True)
         asyncio.create_task(execute_mint_via_agent(http_client, contract_address, func_name, quality_report["score_str"]))
@@ -529,7 +541,6 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 # TELEGRAM CALLBACK POLLING ENGINE
 # ==========================================
 async def telegram_polling_loop(http_client: httpx.AsyncClient):
-    """Listens for Telegram inline button clicks (callbacks) in real time."""
     offset = 0
     logging.info("Telegram callback polling engine started...")
 
@@ -549,7 +560,6 @@ async def telegram_polling_loop(http_client: httpx.AsyncClient):
                         cb_data = cb.get("data", "")
                         message_id = cb.get("message", {}).get("message_id")
 
-                        # Acknowledge button click
                         await http_client.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
                             json={"callback_query_id": cb_id}
@@ -584,10 +594,8 @@ async def listen_onchain(wss_url: str):
     )
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
-        # Launch Telegram Callback Polling Worker concurrently
         asyncio.create_task(telegram_polling_loop(http_client))
 
-        # Check session health on startup
         if not is_session_valid():
             await send_qr_to_telegram(http_client)
 

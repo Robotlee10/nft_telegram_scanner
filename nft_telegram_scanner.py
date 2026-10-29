@@ -112,13 +112,100 @@ def mark_as_notified(address: str):
     conn.close()
 
 # ==========================================
-# 5 QUALITY CHECKS MODULE (REDIRECT-SAFE)
+# STEP 1: OWNERSHIP CHECK
+# ==========================================
+async def already_owns_nft(contract_address: str) -> bool:
+    """Checks on-chain if MY_AGENTIC_WALLET already holds balance in target contract."""
+    try:
+        checksum_target = w3_http.to_checksum_address(contract_address)
+        checksum_wallet = w3_http.to_checksum_address(MY_AGENTIC_WALLET)
+        
+        contract = w3_http.eth.contract(address=checksum_target, abi=BALANCE_ABI)
+        balance = await contract.functions.balanceOf(checksum_wallet).call()
+        
+        if balance > 0:
+            logging.info(f"Skipped {contract_address}: Wallet already holds {balance} NFT(s).")
+            return True
+    except Exception as e:
+        logging.debug(f"balanceOf check skipped for {contract_address}: {e}")
+        return False
+        
+    return False
+
+# ==========================================
+# STEP 2: EXCLUSIVITY SIMULATION
+# ==========================================
+async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, str, str]:
+    """Dual-wallet simulation (Agentic wallet succeeds at 0 BNB, control wallet reverts)."""
+    checksum_target = w3_http.to_checksum_address(contract_address)
+    checksum_agentic = w3_http.to_checksum_address(MY_AGENTIC_WALLET)
+    checksum_control = w3_http.to_checksum_address(CONTROL_WALLET_NO_ID)
+
+    for fn in MINT_FUNCTIONS:
+        agentic_success = False
+        try:
+            tx_agentic = {"from": checksum_agentic, "to": checksum_target, "value": 0, "data": fn["data"]}
+            await w3_http.eth.call(tx_agentic)
+            agentic_success = True
+        except Exception:
+            agentic_success = False
+
+        if not agentic_success:
+            continue
+
+        control_success = False
+        try:
+            tx_control = {"from": checksum_control, "to": checksum_target, "value": 0, "data": fn["data"]}
+            await w3_http.eth.call(tx_control)
+            control_success = True
+        except Exception:
+            control_success = False
+
+        if agentic_success and not control_success:
+            return True, fn["name"], "EXCLUSIVE Agentic Free Mint Confirmed!"
+
+    return False, "None", "Failed simulation or public mint."
+
+# ==========================================
+# STEP 3: INTERFACE VERIFICATION
+# ==========================================
+async def verify_is_nft_contract(contract_address: str) -> tuple[bool, str]:
+    """Verifies ERC-721 / ERC-1155 standard compliance."""
+    checksum_target = w3_http.to_checksum_address(contract_address)
+    
+    try:
+        code = await w3_http.eth.get_code(checksum_target)
+        if not code or len(code) <= 2:
+            return False, "Not a contract"
+
+        code_hex = code.hex()
+        contract_obj = w3_http.eth.contract(address=checksum_target, abi=ERC165_ABI)
+
+        try:
+            if await contract_obj.functions.supportsInterface(bytes.fromhex(ERC721_INTERFACE_ID[2:])).call():
+                return True, "ERC-721"
+        except Exception:
+            pass
+
+        try:
+            if await contract_obj.functions.supportsInterface(bytes.fromhex(ERC1155_INTERFACE_ID[2:])).call():
+                return True, "ERC-1155"
+        except Exception:
+            pass
+
+        if "63706577" in code_hex or "70a08231" in code_hex:
+            return True, "ERC-721 (Bytecode Verified)"
+
+    except Exception as e:
+        logging.debug(f"NFT check failed for {contract_address}: {e}")
+
+    return False, "Non-NFT"
+
+# ==========================================
+# STEP 4: 5 QUALITY CHECKS (ETHERSCAN V2 FIXED)
 # ==========================================
 async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: str) -> dict:
-    """
-    Evaluates 5 quality indicators with follow_redirects enabled.
-    Returns score breakdown.
-    """
+    """Evaluates 5 quality indicators using unified Etherscan V2 API for BSC."""
     checksum_target = w3_http.to_checksum_address(contract_address)
     passed_count = 0
     results = {}
@@ -160,21 +247,19 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     except Exception:
         results["2_metadata"] = "❌ Metadata Unreachable"
 
-        # -----------------------------------------------------------
-    # CHECK 3: Source Code Verification (Etherscan V2 for BSC)
-    # -----------------------------------------------------------
+    # CHECK 3: Source Code Verification (Etherscan V2 API for BSC ChainID 56)
     try:
         url = f"https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address={contract_address}"
-        res = await http_client.get(url, timeout=5.0)
+        res = await http_client.get(url, timeout=5.0, follow_redirects=True)
         if res.status_code == 200:
             source_data = res.json().get("result", [{}])[0]
             if source_data.get("SourceCode"):
-                results["3_source"] = "✅ Verified on BscScan"
+                results["3_source"] = "✅ Verified Source Code"
                 passed_count += 1
             else:
                 results["3_source"] = "❌ Unverified Source Code"
         else:
-            results["3_source"] = f"⚠️ BscScan Unverified ({res.status_code})"
+            results["3_source"] = f"⚠️ Unverified ({res.status_code})"
     except Exception:
         results["3_source"] = "⚠️ Source Check Error"
 
@@ -214,91 +299,7 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     }
 
 # ==========================================
-# ON-CHAIN BASE CHECKS
-# ==========================================
-async def already_owns_nft(contract_address: str) -> bool:
-    """Checks on-chain if MY_AGENTIC_WALLET already holds balance in target contract."""
-    try:
-        checksum_target = w3_http.to_checksum_address(contract_address)
-        checksum_wallet = w3_http.to_checksum_address(MY_AGENTIC_WALLET)
-        
-        contract = w3_http.eth.contract(address=checksum_target, abi=BALANCE_ABI)
-        balance = await contract.functions.balanceOf(checksum_wallet).call()
-        
-        if balance > 0:
-            logging.info(f"Skipped {contract_address}: Wallet already holds {balance} NFT(s).")
-            return True
-    except Exception as e:
-        logging.debug(f"balanceOf check skipped for {contract_address}: {e}")
-        return False
-        
-    return False
-
-async def verify_is_nft_contract(contract_address: str) -> tuple[bool, str]:
-    """Verifies ERC-721 / ERC-1155 standard compliance."""
-    checksum_target = w3_http.to_checksum_address(contract_address)
-    
-    try:
-        code = await w3_http.eth.get_code(checksum_target)
-        if not code or len(code) <= 2:
-            return False, "Not a contract"
-
-        code_hex = code.hex()
-        contract_obj = w3_http.eth.contract(address=checksum_target, abi=ERC165_ABI)
-
-        try:
-            if await contract_obj.functions.supportsInterface(bytes.fromhex(ERC721_INTERFACE_ID[2:])).call():
-                return True, "ERC-721"
-        except Exception:
-            pass
-
-        try:
-            if await contract_obj.functions.supportsInterface(bytes.fromhex(ERC1155_INTERFACE_ID[2:])).call():
-                return True, "ERC-1155"
-        except Exception:
-            pass
-
-        if "63706577" in code_hex or "70a08231" in code_hex:
-            return True, "ERC-721 (Bytecode Verified)"
-
-    except Exception as e:
-        logging.debug(f"NFT check failed for {contract_address}: {e}")
-
-    return False, "Non-NFT"
-
-async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, str, str]:
-    """Dual-wallet simulation (Agentic wallet succeeds, control wallet reverts)."""
-    checksum_target = w3_http.to_checksum_address(contract_address)
-    checksum_agentic = w3_http.to_checksum_address(MY_AGENTIC_WALLET)
-    checksum_control = w3_http.to_checksum_address(CONTROL_WALLET_NO_ID)
-
-    for fn in MINT_FUNCTIONS:
-        agentic_success = False
-        try:
-            tx_agentic = {"from": checksum_agentic, "to": checksum_target, "value": 0, "data": fn["data"]}
-            await w3_http.eth.call(tx_agentic)
-            agentic_success = True
-        except Exception:
-            agentic_success = False
-
-        if not agentic_success:
-            continue
-
-        control_success = False
-        try:
-            tx_control = {"from": checksum_control, "to": checksum_target, "value": 0, "data": fn["data"]}
-            await w3_http.eth.call(tx_control)
-            control_success = True
-        except Exception:
-            control_success = False
-
-        if agentic_success and not control_success:
-            return True, fn["name"], "EXCLUSIVE Agentic Free Mint Confirmed!"
-
-    return False, "None", "Failed simulation or public mint."
-
-# ==========================================
-# TELEGRAM NOTIFICATIONS
+# STEP 5: TELEGRAM ALERT SENDER
 # ==========================================
 async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict):
     agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB. execute it, if it preview clearly and would return a ERC-721 token"
@@ -341,33 +342,40 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         logging.error(f"Failed sending alert: {e}")
 
 # ==========================================
-# ASYNCHRONOUS WORKER PROCESSOR
+# STRICT SEQUENTIAL WORKER PIPELINE
 # ==========================================
 async def process_contract_candidate(http_client: httpx.AsyncClient, contract_address: str, tx_hash: str):
-    """Processes contract candidate with ownership pre-filtering and quality evaluation."""
+    """
+    STRICT CHECK SEQUENCE:
+    1. DB Check (Drop if already alerted)
+    2. Ownership Check (Drop if MY_AGENTIC_WALLET already holds this NFT)
+    3. Exclusivity Test (Drop if NOT free strictly for Agentic ID holders)
+    4. NFT Standard Test (Confirm ERC-721/1155)
+    5. Quality Scoring & Telegram Notification
+    """
+    # 0. Fast DB Check
     if is_already_notified(contract_address):
         return
 
-    # 1. Check if contract is an NFT standard
-    is_nft, nft_standard = await verify_is_nft_contract(contract_address)
-    if not is_nft:
-        return
-
-    # 2. Check if wallet already holds this NFT
+    # 1. FIRST CHECK: Do I already own this NFT?
     if await already_owns_nft(contract_address):
         mark_as_notified(contract_address)
         return
 
-    # 3. Dual-wallet simulation
+    # 2. SECOND CHECK: Is it free strictly for Agentic ID holders?
     is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(contract_address)
-    if is_exclusive:
-        mark_as_notified(contract_address)
-        
-        # Run 5 Quality Checks (Non-blocking inspection)
-        quality_report = await run_quality_checks(http_client, contract_address)
-        
-        # Send Telegram alert
-        await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report)
+    if not is_exclusive:
+        return
+
+    # 3. THIRD CHECK: Is it a valid NFT standard contract?
+    is_nft, nft_standard = await verify_is_nft_contract(contract_address)
+    if not is_nft:
+        return
+
+    # If it passed 1, 2, and 3 -> Mark DB, run Quality Scores, and Alert!
+    mark_as_notified(contract_address)
+    quality_report = await run_quality_checks(http_client, contract_address)
+    await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report)
 
 # ==========================================
 # WEBSOCKET EVENT LISTENER

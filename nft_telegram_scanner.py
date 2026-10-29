@@ -266,17 +266,19 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
     checksum_control = w3_http.to_checksum_address(CONTROL_WALLET_NO_ID)
 
     for fn in MINT_FUNCTIONS:
-        agentic_success = False
+        # Test 1: Try with 0 BNB (Strict Free Mint check)
+        agentic_success_free = False
         try:
             tx_agentic = {"from": checksum_agentic, "to": checksum_target, "value": 0, "data": fn["data"]}
             await w3_http.eth.call(tx_agentic)
-            agentic_success = True
+            agentic_success_free = True
         except Exception:
-            agentic_success = False
+            agentic_success_free = False
 
-        if not agentic_success:
-            continue
+        if not agentic_success_free:
+            continue  # Skip if it fails even with 0 BNB (implies it might require payment or specific conditions)
 
+        # Test with Control Wallet (Agentic ID Gate check)
         control_success = False
         try:
             tx_control = {"from": checksum_control, "to": checksum_target, "value": 0, "data": fn["data"]}
@@ -285,10 +287,11 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
         except Exception:
             control_success = False
 
-        if agentic_success and not control_success:
+        if agentic_success_free and not control_security_passed := not control_success:
             return True, fn["name"], "EXCLUSIVE Agentic Free Mint Confirmed!"
 
-    return False, "None", "Failed simulation or public mint."
+    return False, "None", "Failed simulation, paid mint, or public access."
+
 
 async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: str) -> dict:
     checksum_target = w3_http.to_checksum_address(contract_address)

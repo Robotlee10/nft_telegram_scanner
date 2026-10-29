@@ -1,5 +1,3 @@
-print(">>> SCRIPT LAUNCHED SUCCESSFULLY <<<", flush=True)
-
 import os
 import io
 import re
@@ -31,7 +29,6 @@ BSC_WSS_POOL = [
     "wss://rpc-bsc.blockmachine.io",
     "wss://bnb-chain.wss.run"
 ]
-
 
 BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-dataseed1.binance.org/")
 
@@ -110,7 +107,7 @@ def rotate_wss_endpoint() -> str:
     return next_endpoint
 
 # ==========================================
-# PERSISTENT DUAL-DATABASE (SUPABASE + SQLITE)
+# PERSISTENT DUAL-DATABASE (ASYNC NON-BLOCKING)
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -124,7 +121,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-def is_already_notified(address: str) -> bool:
+async def is_already_notified(address: str) -> bool:
     addr = address.lower()
 
     # 1. Fast Local SQLite Check
@@ -136,12 +133,14 @@ def is_already_notified(address: str) -> bool:
     if row is not None:
         return True
 
-    # 2. Remote Supabase Check
+    # 2. Remote Supabase Check (Executed in background thread to prevent loop freezes)
     if supabase:
         try:
-            res = supabase.table("notified_contracts").select("address").eq("address", addr).execute()
+            def _check_supabase():
+                return supabase.table("notified_contracts").select("address").eq("address", addr).execute()
+
+            res = await asyncio.to_thread(_check_supabase)
             if res.data and len(res.data) > 0:
-                # Sync back to local SQLite cache
                 conn = sqlite3.connect(DB_FILE)
                 cursor = conn.cursor()
                 cursor.execute("INSERT OR IGNORE INTO notified_contracts (address) VALUES (?)", (addr,))
@@ -153,7 +152,7 @@ def is_already_notified(address: str) -> bool:
 
     return False
 
-def mark_as_notified(address: str, nft_standard: str = "", score: str = "", func_name: str = "", tx_hash: str = ""):
+async def mark_as_notified(address: str, nft_standard: str = "", score: str = "", func_name: str = "", tx_hash: str = ""):
     addr = address.lower()
 
     # 1. Record in local SQLite cache
@@ -163,7 +162,7 @@ def mark_as_notified(address: str, nft_standard: str = "", score: str = "", func
     conn.commit()
     conn.close()
 
-    # 2. Record/Upsert in Supabase Dashboard
+    # 2. Record/Upsert in Supabase Dashboard (Executed in background thread)
     if supabase:
         try:
             payload = {
@@ -173,7 +172,11 @@ def mark_as_notified(address: str, nft_standard: str = "", score: str = "", func
                 "function_name": func_name,
                 "tx_hash": tx_hash
             }
-            supabase.table("notified_contracts").upsert(payload).execute()
+
+            def _upsert_supabase():
+                supabase.table("notified_contracts").upsert(payload).execute()
+
+            await asyncio.to_thread(_upsert_supabase)
             logging.info(f"Saved contract {addr} to Supabase dashboard.")
         except Exception as e:
             logging.error(f"Failed writing {addr} to Supabase: {e}")
@@ -400,7 +403,7 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
 # STRICT SEQUENTIAL WORKER PIPELINE
 # ==========================================
 async def process_contract_candidate(http_client: httpx.AsyncClient, contract_address: str, tx_hash: str):
-    if is_already_notified(contract_address):
+    if await is_already_notified(contract_address):
         return
 
     # 1. NFT Standard Test (Must be ERC-721 or ERC-1155) -> Drops BEP-20 tokens
@@ -410,7 +413,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 
     # 2. Ownership Check (Must NOT already hold balance in wallet)
     if await already_owns_nft(contract_address):
-        mark_as_notified(contract_address, nft_standard=nft_standard)
+        await mark_as_notified(contract_address, nft_standard=nft_standard)
         return
 
     # 3. Exclusivity Test (Must be 0 BNB strictly for Agentic ID holders)
@@ -420,8 +423,8 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 
     quality_report = await run_quality_checks(http_client, contract_address)
     
-    # Record to both local SQLite and Supabase dashboard
-    mark_as_notified(
+    # Record to both local SQLite and Supabase dashboard asynchronously
+    await mark_as_notified(
         address=contract_address,
         nft_standard=nft_standard,
         score=quality_report["score_str"],
@@ -441,8 +444,7 @@ async def listen_onchain(wss_url: str):
     ws_provider = WebSocketProvider(
         wss_url,
         websocket_kwargs={
-            "ping_interval": 20,
-            "ping_timeout": 20,
+            "ping_interval": None,  # Prevent client ping timeouts from closing connection during load
             "close_timeout": 10
         }
     )
@@ -467,7 +469,7 @@ async def listen_onchain(wss_url: str):
                     contract_address = result.get("address", "").lower()
                     tx_hash = result.get("transactionHash", "").hex()
 
-                    if contract_address and not is_already_notified(contract_address):
+                    if contract_address and not await is_already_notified(contract_address):
                         asyncio.create_task(process_contract_candidate(http_client, contract_address, tx_hash))
 
                 except Exception as e:
@@ -488,4 +490,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                     

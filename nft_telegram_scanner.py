@@ -234,7 +234,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
     if not is_nft:
         return
 
-    # 2. CHECK IF WALLET ALREADY HOLDS THIS NFT
+    # 2. Check if wallet already holds this NFT
     if await already_owns_nft(contract_address):
         mark_as_notified(contract_address)
         return
@@ -302,5 +302,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-me__ == "__main__":
-    asyncio.run(main())
+    

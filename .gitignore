@@ -14,3 +14,5 @@ env/
 
 # Runtime data
 agentic_mints.db
+.agents
+skills-lock.json

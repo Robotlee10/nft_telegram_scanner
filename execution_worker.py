@@ -37,11 +37,13 @@ BSC_CHAIN_ID = 56
 AUTO_MINT_THRESHOLD = 3  # Score >= 3 triggers automated minting
 RPC_RECEIPT_TIMEOUT = 36 # Seconds to poll for transaction receipt
 RPC_POLL_INTERVAL = 2    # Seconds between receipt checks
-BAW_LOCAL_BIN = os.path.join(
+BAW_PACKAGE_ENTRY = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "node_modules",
-    ".bin",
-    "baw.cmd" if os.name == "nt" else "baw"
+    "@binance",
+    "agentic-wallet",
+    "dist",
+    "index.js",
 )
 
 MINT_CALLDATA = {
@@ -149,19 +151,19 @@ class WalletCLIError(RuntimeError):
     pass
 
 def _baw_command(arguments: list[str]) -> list[str]:
-    executable = shutil.which("baw")
-    if executable is None and os.path.isfile(BAW_LOCAL_BIN):
-        executable = BAW_LOCAL_BIN
-    if executable is None:
-        raise WalletCLIError(
-            "Binance Agentic Wallet CLI is missing. Install project dependencies with `npm install`."
-        )
+    if os.path.isfile(BAW_PACKAGE_ENTRY):
+        node = shutil.which("node")
+        if not node:
+            raise WalletCLIError("Node.js is required to run the Binance Agentic Wallet CLI.")
+        return [node, BAW_PACKAGE_ENTRY, *arguments]
 
-    command = [executable, *arguments]
-    if os.name == "nt" and executable.lower().endswith((".cmd", ".bat")):
-        command_line = subprocess.list2cmdline(command)
-        return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", f'"{command_line}"']
-    return command
+    executable = shutil.which("baw")
+    if executable and not executable.lower().endswith((".cmd", ".bat")):
+        return [executable, *arguments]
+
+    raise WalletCLIError(
+        "Binance Agentic Wallet CLI is missing. Install project dependencies with `npm install`."
+    )
 
 async def run_baw(arguments: list[str], timeout: float = 30.0) -> dict:
     command = _baw_command(arguments)
@@ -181,10 +183,27 @@ async def run_baw(arguments: list[str], timeout: float = 30.0) -> dict:
     except (OSError, subprocess.TimeoutExpired) as e:
         raise WalletCLIError(f"Binance Agentic Wallet CLI failed: {e}") from e
 
-    try:
-        response = json.loads(result.stdout)
-    except json.JSONDecodeError as e:
-        raise WalletCLIError("Binance Agentic Wallet CLI returned invalid JSON.") from e
+    response = None
+    decoder = json.JSONDecoder()
+    for output in (result.stdout, result.stderr):
+        for index, character in enumerate(output):
+            if character != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(output[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                response = candidate
+                break
+        if response is not None:
+            break
+
+    if response is None:
+        raise WalletCLIError(
+            "Binance Agentic Wallet CLI returned no valid JSON "
+            f"(exit code {result.returncode}). Check Node.js and the installed CLI."
+        )
 
     if result.returncode != 0 or not response.get("success"):
         error = response.get("error", {})

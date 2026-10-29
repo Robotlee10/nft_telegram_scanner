@@ -15,5 +15,7 @@ node_modules/
 
 # Runtime data
 agentic_mints.db
+agentic_mints.db-shm
+agentic_mints.db-wal
 .agents
 skills-lock.json

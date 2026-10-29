@@ -112,23 +112,21 @@ def mark_as_notified(address: str):
     conn.close()
 
 # ==========================================
-# 5 QUALITY CHECKS MODULE
+# 5 QUALITY CHECKS MODULE (REDIRECT-SAFE)
 # ==========================================
 async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: str) -> dict:
     """
-    Evaluates 5 indicators on the contract without blocking the alert.
+    Evaluates 5 quality indicators with follow_redirects enabled.
     Returns score breakdown.
     """
     checksum_target = w3_http.to_checksum_address(contract_address)
     passed_count = 0
     results = {}
 
-    # -----------------------------------------------------------
     # CHECK 1: Secondary Market Liquidity (Element Market API)
-    # -----------------------------------------------------------
     try:
         url = f"https://api.element.market/openapi/v1/contract/stat?contract_address={contract_address}"
-        res = await http_client.get(url, timeout=4.0)
+        res = await http_client.get(url, timeout=5.0, follow_redirects=True)
         if res.status_code == 200:
             data = res.json().get("data", {})
             has_volume = float(data.get("volume", 0)) > 0 or float(data.get("floor_price", 0)) > 0
@@ -142,9 +140,7 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     except Exception:
         results["1_market"] = "⚠️ Market Unindexed"
 
-    # -----------------------------------------------------------
     # CHECK 2: Metadata & Asset Integrity (tokenURI)
-    # -----------------------------------------------------------
     try:
         contract = w3_http.eth.contract(address=checksum_target, abi=METADATA_ABI)
         uri = ""
@@ -164,12 +160,10 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     except Exception:
         results["2_metadata"] = "❌ Metadata Unreachable"
 
-    # -----------------------------------------------------------
-    # CHECK 3: Source Code Verification (BscScan Free Check)
-    # -----------------------------------------------------------
+    # CHECK 3: Source Code Verification (BscScan Free Check with Follow Redirects)
     try:
         url = f"https://api.bscscan.com/api?module=contract&action=getsourcecode&address={contract_address}"
-        res = await http_client.get(url, timeout=4.0)
+        res = await http_client.get(url, timeout=5.0, follow_redirects=True)
         if res.status_code == 200:
             source_data = res.json().get("result", [{}])[0]
             if source_data.get("SourceCode"):
@@ -178,20 +172,17 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
             else:
                 results["3_source"] = "❌ Unverified Source Code"
         else:
-            results["3_source"] = "⚠️ BscScan Unverified"
+            results["3_source"] = f"⚠️ BscScan Unverified ({res.status_code})"
     except Exception:
         results["3_source"] = "⚠️ Source Check Error"
 
-    # -----------------------------------------------------------
     # CHECK 4: Unique Minter Velocity (Anti-Bot Farm Check)
-    # -----------------------------------------------------------
     try:
         logs = await w3_http.eth.get_logs({
             "address": checksum_target,
             "topics": [ERC721_TRANSFER_TOPIC, ZERO_ADDRESS_TOPIC],
             "fromBlock": "latest"
         })
-        # Extract unique minter receiver addresses
         unique_minters = set(log["topics"][2].hex() for log in logs if len(log["topics"]) > 2)
         if len(unique_minters) >= 2 or len(logs) < 3:
             results["4_diversity"] = f"✅ Organic Demand ({len(unique_minters)} minters)"
@@ -202,9 +193,7 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
         results["4_diversity"] = "✅ Single Mint Event"
         passed_count += 1
 
-    # -----------------------------------------------------------
     # CHECK 5: ERC-2981 Royalty Standard Support
-    # -----------------------------------------------------------
     try:
         contract_165 = w3_http.eth.contract(address=checksum_target, abi=ERC165_ABI)
         has_royalty = await contract_165.functions.supportsInterface(bytes.fromhex(ERC2981_ROYALTY_INTERFACE_ID[2:])).call()
@@ -310,7 +299,7 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
 # TELEGRAM NOTIFICATIONS
 # ==========================================
 async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict):
-    agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB."
+    agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB. execute it, if it preview clearly and would return a ERC-721 token"
 
     details = quality_report["details"]
     quality_score = quality_report["score_str"]
@@ -375,7 +364,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         # Run 5 Quality Checks (Non-blocking inspection)
         quality_report = await run_quality_checks(http_client, contract_address)
         
-        # Send Telegram alert regardless of score
+        # Send Telegram alert
         await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report)
 
 # ==========================================
@@ -394,7 +383,7 @@ async def listen_onchain(wss_url: str):
         }
     )
 
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(follow_redirects=True) as http_client:
         async with AsyncWeb3(ws_provider) as w3_ws:
             logging.info(f"Connected to {wss_url}. Streaming mint logs...")
 
@@ -435,3 +424,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    

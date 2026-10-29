@@ -7,12 +7,13 @@ import asyncio
 import logging
 import sqlite3
 import httpx
+from datetime import datetime, timezone
 from pathlib import Path
 from web3 import AsyncWeb3
 from web3.providers import WebSocketProvider, AsyncHTTPProvider
 
 # ==========================================
-# CONFIGURATION & RPC POOLS
+# CONFIGURATION & HIGH-SPEED RPC POOLS
 # ==========================================
 BSC_WSS_POOL = [
     os.getenv("BSC_WSS_URL", "wss://bsc-mainnet.nodereal.io/ws/v1/6a254628001a4daab023c41cea7e686c"),
@@ -30,6 +31,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
 MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET", "0xYourBinanceAgenticWalletAddress")
 CONTROL_WALLET_NO_ID = os.getenv("CONTROL_WALLET_NO_ID", "0x0000000000000000000000000000000000000001")
+
+# Supabase REST Configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Standard On-Chain Topics
 ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -88,7 +93,47 @@ def rotate_wss_endpoint() -> str:
     return next_endpoint
 
 # ==========================================
-# PERSISTENT DATABASE
+# ASYNC SUPABASE REST ENGINE
+# ==========================================
+def get_supabase_headers() -> dict:
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+
+async def fetch_supabase_record(http_client: httpx.AsyncClient, address: str) -> dict | None:
+    """Non-blocking query to fetch contract record from Supabase REST API."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/notified_contracts?address=eq.{address.lower()}"
+    try:
+        res = await http_client.get(url, headers=get_supabase_headers(), timeout=5.0)
+        if res.status_code == 200:
+            data = res.json()
+            if data and len(data) > 0:
+                return data[0]
+    except Exception as e:
+        logging.error(f"Supabase GET error for {address}: {e}")
+    return None
+
+async def upsert_supabase_record(http_client: httpx.AsyncClient, payload: dict):
+    """Non-blocking upsert to save or update contract record in Supabase REST API."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/notified_contracts"
+    headers = get_supabase_headers()
+    headers["Prefer"] = "resolution=merge-duplicates"
+    try:
+        res = await http_client.post(url, json=payload, headers=headers, timeout=5.0)
+        if res.status_code in [200, 201]:
+            logging.info(f"Synced contract {payload.get('address')} to Supabase.")
+    except Exception as e:
+        logging.error(f"Supabase UPSERT error for {payload.get('address')}: {e}")
+
+# ==========================================
+# LOCAL SQLITE DATABASE (SECONDARY CACHE)
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -102,15 +147,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-def is_already_notified(address: str) -> bool:
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM notified_contracts WHERE address = ?", (address.lower(),))
-    row = cursor.fetchone()
-    conn.close()
-    return row is not None
-
-def mark_as_notified(address: str):
+def mark_local_cache(address: str):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("INSERT OR IGNORE INTO notified_contracts (address) VALUES (?)", (address.lower(),))
@@ -294,16 +331,18 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     }
 
 # ==========================================
-# ALERT SENDER
+# ALERT SENDER WITH RE-NOTIFICATION BANNER
 # ==========================================
-async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict):
+async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict, is_reminder: bool = False):
     agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB. execute it, if it preview clearly and would return a ERC-721 token"
 
     details = quality_report["details"]
     quality_score = quality_report["score_str"]
 
+    header_title = "⏰ <b>1-HOUR REMINDER: UNMINTED EXCLUSIVE NFT</b> ⏰" if is_reminder else "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨"
+
     message = (
-        f"🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨\n\n"
+        f"{header_title}\n\n"
         f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
         f"🎨 <b>NFT Standard:</b> ✅ {nft_standard}\n"
         f"🛡️ <b>Access Gate:</b> 🔒 Agentic ID Holders Only\n"
@@ -331,35 +370,90 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
     try:
         res = await http_client.post(url, json=payload, timeout=10.0)
         if res.status_code == 200:
-            logging.info(f"Alert sent for contract: {contract} (Score: {quality_score})")
+            logging.info(f"Alert sent for contract: {contract} (Reminder: {is_reminder})")
     except Exception as e:
         logging.error(f"Failed sending alert: {e}")
 
 # ==========================================
-# STRICT SEQUENTIAL WORKER PIPELINE
+# PIPELINE WITH 1-HOUR UNMINTED CHECK
 # ==========================================
 async def process_contract_candidate(http_client: httpx.AsyncClient, contract_address: str, tx_hash: str):
-    if is_already_notified(contract_address):
+    addr = contract_address.lower()
+
+    # 1. Fetch record from Supabase
+    record = await fetch_supabase_record(http_client, addr)
+
+    if record:
+        # If already marked as minted, drop candidate immediately
+        if record.get("minted") is True:
+            return
+
+        # Check timestamp elapsed since last notification
+        last_notified_str = record.get("last_notified_at")
+        if last_notified_str:
+            try:
+                # Parse ISO timestamp
+                last_dt = datetime.fromisoformat(last_notified_str.replace("Z", "+00:00"))
+                now_dt = datetime.now(timezone.utc)
+                elapsed_seconds = (now_dt - last_dt).total_seconds()
+
+                # Ignore candidate if notified less than 1 hour (3600 seconds) ago
+                if elapsed_seconds < 3600:
+                    return
+            except Exception as e:
+                logging.debug(f"Timestamp parse error: {e}")
+                return
+
+        # Passed 1 hour without being minted -> Trigger Re-Notification Alert!
+        quality_report = await run_quality_checks(http_client, addr)
+        
+        # Update last_notified_at in Supabase to current timestamp
+        update_payload = {
+            "address": addr,
+            "last_notified_at": datetime.now(timezone.utc).isoformat()
+        }
+        await upsert_supabase_record(http_client, update_payload)
+
+        await send_telegram_alert(
+            http_client,
+            contract=addr,
+            nft_standard=record.get("nft_standard", "ERC-721"),
+            func_name=record.get("function_name", "mint(1)"),
+            tx_hash=tx_hash,
+            quality_report=quality_report,
+            is_reminder=True
+        )
         return
 
-    # 1. NFT Standard Test (Must be ERC-721 or ERC-1155) -> Drops BEP-20 tokens
-    is_nft, nft_standard = await verify_is_nft_contract(contract_address)
+    # 2. Candidate is NEW (not in Supabase) -> Run Full Inspection Pipeline
+    is_nft, nft_standard = await verify_is_nft_contract(addr)
     if not is_nft:
         return
 
-    # 2. Ownership Check (Must NOT already hold balance in wallet)
-    if await already_owns_nft(contract_address):
-        mark_as_notified(contract_address)
+    if await already_owns_nft(addr):
+        mark_local_cache(addr)
         return
 
-    # 3. Exclusivity Test (Must be 0 BNB strictly for Agentic ID holders)
-    is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(contract_address)
+    is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(addr)
     if not is_exclusive:
         return
 
-    mark_as_notified(contract_address)
-    quality_report = await run_quality_checks(http_client, contract_address)
-    await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report)
+    # Candidate Passed Entry Rules -> Run Quality Checks & Save
+    mark_local_cache(addr)
+    quality_report = await run_quality_checks(http_client, addr)
+
+    new_payload = {
+        "address": addr,
+        "nft_standard": nft_standard,
+        "quality_score": quality_report["score_str"],
+        "function_name": func_name,
+        "tx_hash": tx_hash,
+        "minted": False,
+        "last_notified_at": datetime.now(timezone.utc).isoformat()
+    }
+    await upsert_supabase_record(http_client, new_payload)
+
+    await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)
 
 # ==========================================
 # WEBSOCKET EVENT LISTENER
@@ -397,7 +491,7 @@ async def listen_onchain(wss_url: str):
                     contract_address = result.get("address", "").lower()
                     tx_hash = result.get("transactionHash", "").hex()
 
-                    if contract_address and not is_already_notified(contract_address):
+                    if contract_address:
                         asyncio.create_task(process_contract_candidate(http_client, contract_address, tx_hash))
 
                 except Exception as e:
@@ -418,4 +512,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        

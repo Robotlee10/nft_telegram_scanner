@@ -7,7 +7,6 @@ import asyncio
 import logging
 import sqlite3
 import httpx
-from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from web3 import AsyncWeb3
@@ -41,10 +40,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
 MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET", "0xYourBinanceAgenticWalletAddress")
 CONTROL_WALLET_NO_ID = os.getenv("CONTROL_WALLET_NO_ID", "0x0000000000000000000000000000000000000001")
-
-# Supabase REST Configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Standard On-Chain Topics
 ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -102,58 +97,7 @@ def rotate_wss_endpoint() -> str:
     return next_endpoint
 
 # ==========================================
-# ASYNC SUPABASE REST ENGINE WITH CACHE
-# ==========================================
-def get_supabase_headers() -> dict:
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation"
-    }
-
-# Local Cache to prevent repeated network requests for recently queried addresses
-SUPABASE_CACHE: dict[str, dict] = {}
-
-async def fetch_supabase_record(http_client: httpx.AsyncClient, address: str) -> dict | None:
-    """Non-blocking query to fetch contract record with local in-memory caching."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-    
-    addr_lower = address.lower()
-    if addr_lower in SUPABASE_CACHE:
-        return SUPABASE_CACHE[addr_lower]
-
-    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/notified_contracts?address=eq.{addr_lower}"
-    try:
-        res = await http_client.get(url, headers=get_supabase_headers(), timeout=5.0)
-        if res.status_code == 200:
-            data = res.json()
-            if data and len(data) > 0:
-                SUPABASE_CACHE[addr_lower] = data[0]
-                return data[0]
-    except Exception as e:
-        logging.error(f"Supabase GET error for {address}: {e}")
-    return None
-
-async def upsert_supabase_record(http_client: httpx.AsyncClient, payload: dict):
-    """Non-blocking upsert to save or update contract record in Supabase REST API."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return
-    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/notified_contracts"
-    headers = get_supabase_headers()
-    headers["Prefer"] = "resolution=merge-duplicates"
-    try:
-        res = await http_client.post(url, json=payload, headers=headers, timeout=5.0)
-        if res.status_code in [200, 201]:
-            # Update local memory cache as well
-            SUPABASE_CACHE[payload.get("address").lower()] = payload
-            logging.info(f"Synced contract {payload.get('address')} to Supabase.")
-    except Exception as e:
-        logging.error(f"Supabase UPSERT error for {payload.get('address')}: {e}")
-
-# ==========================================
-# LOCAL SQLITE DATABASE (SECONDARY CACHE)
+# LOCAL SQLITE DATABASE ENGINE (SOLE STORAGE)
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -161,18 +105,54 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS notified_contracts (
             address TEXT PRIMARY KEY,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            nft_standard TEXT,
+            function_name TEXT,
+            tx_hash TEXT,
+            minted BOOLEAN DEFAULT 0,
+            last_notified_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
     conn.close()
 
-def mark_local_cache(address: str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO notified_contracts (address) VALUES (?)", (address.lower(),))
-    conn.commit()
-    conn.close()
+def get_local_record(address: str) -> dict | None:
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT address, nft_standard, function_name, tx_hash, minted, last_notified_at FROM notified_contracts WHERE address = ?",
+            (address.lower(),)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {
+                "address": row[0],
+                "nft_standard": row[1],
+                "function_name": row[2],
+                "tx_hash": row[3],
+                "minted": bool(row[4]),
+                "last_notified_at": row[5]
+            }
+    except Exception as e:
+        logging.debug(f"SQLite read error for {address}: {e}")
+    return None
+
+def save_local_record(address: str, nft_standard: str, function_name: str, tx_hash: str, minted: bool = False):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO notified_contracts (address, nft_standard, function_name, tx_hash, minted, last_notified_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(address) DO UPDATE SET
+                last_notified_at = excluded.last_notified_at
+        """, (address.lower(), nft_standard, function_name, tx_hash, minted, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+        logging.info(f"Saved contract {address} to local SQLite cache.")
+    except Exception as e:
+        logging.error(f"SQLite write error for {address}: {e}")
 
 # ==========================================
 # ON-CHAIN CHECKS MODULE
@@ -395,7 +375,7 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         logging.error(f"Failed sending alert: {e}")
 
 # ==========================================
-# CONCURRENT DUPLICATE PREVENTION LOCK
+# PIPELINE WITH LOCAL CACHE & LOCKING
 # ==========================================
 ACTIVE_PROCESSING = set()
 
@@ -408,23 +388,21 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
     
     ACTIVE_PROCESSING.add(addr)
     try:
-        # 1. Fetch record from Supabase
-        record = await fetch_supabase_record(http_client, addr)
+        # 1. Fetch record from local SQLite DB
+        record = get_local_record(addr)
 
         if record:
-            # If already marked as minted, drop candidate immediately
-            if record.get("minted") is True:
+            if record["minted"] is True:
                 return
 
-            # Check timestamp elapsed since last notification
-            last_notified_str = record.get("last_notified_at")
+            last_notified_str = record["last_notified_at"]
             if last_notified_str:
                 try:
                     last_dt = datetime.fromisoformat(last_notified_str.replace("Z", "+00:00"))
                     now_dt = datetime.now(timezone.utc)
                     elapsed_seconds = (now_dt - last_dt).total_seconds()
 
-                    # Ignore candidate if notified less than 1 hour (3600 seconds) ago
+                    # Ignore candidate if notified less than 1 hour ago
                     if elapsed_seconds < 3600:
                         return
                 except Exception as e:
@@ -434,30 +412,29 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
             # Passed 1 hour without being minted -> Trigger Re-Notification Alert!
             quality_report = await run_quality_checks(http_client, addr)
             
-            update_payload = {
-                "address": addr,
-                "last_notified_at": datetime.now(timezone.utc).isoformat()
-            }
-            await upsert_supabase_record(http_client, update_payload)
+            # Update last notified timestamp locally
+            save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
 
             await send_telegram_alert(
                 http_client,
                 contract=addr,
-                nft_standard=record.get("nft_standard", "ERC-721"),
-                func_name=record.get("function_name", "mint(1)"),
+                nft_standard=record["nft_standard"],
+                func_name=record["function_name"],
                 tx_hash=tx_hash,
                 quality_report=quality_report,
                 is_reminder=True
             )
             return
 
-        # 2. Candidate is NEW (not in Supabase) -> Run Full Inspection Pipeline
+        # 2. Candidate is NEW -> Save placeholder immediately to prevent concurrent duplicates
+        save_local_record(addr, "ERC-721", "mint(1)", tx_hash, minted=False)
+
+        # Run Full Inspection Pipeline
         is_nft, nft_standard = await verify_is_nft_contract(addr)
         if not is_nft:
             return
 
         if await already_owns_nft(addr):
-            mark_local_cache(addr)
             return
 
         is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(addr)
@@ -465,24 +442,12 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
             return
 
         # Candidate Passed Entry Rules -> Run Quality Checks & Save
-        mark_local_cache(addr)
         quality_report = await run_quality_checks(http_client, addr)
 
-        new_payload = {
-            "address": addr,
-            "nft_standard": nft_standard,
-            "quality_score": quality_report["score_str"],
-            "function_name": func_name,
-            "tx_hash": tx_hash,
-            "minted": False,
-            "last_notified_at": datetime.now(timezone.utc).isoformat()
-        }
-        await upsert_supabase_record(http_client, new_payload)
-
+        save_local_record(addr, nft_standard, func_name, tx_hash, minted=False)
         await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)
 
     finally:
-        # Always release the lock when finished processing this address
         ACTIVE_PROCESSING.remove(addr)
 
 # ==========================================
@@ -531,6 +496,7 @@ async def listen_onchain(wss_url: str):
 # MAIN LOOP WITH AUTOMATIC FAILOVER
 # ==========================================
 async def main():
+    init_db()
     while True:
         current_endpoint = get_active_wss_endpoint()
         try:

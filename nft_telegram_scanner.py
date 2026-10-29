@@ -8,12 +8,15 @@ from web3 import AsyncWeb3
 from web3.providers import WebSocketProvider, AsyncHTTPProvider
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & RPC POOLS
 # ==========================================
-# WebSocket Node for LIVE EVENT STREAMING ONLY
-BSC_WSS_URL = os.getenv("BSC_WSS_URL", "wss://bsc-rpc.publicnode.com")
+BSC_WSS_POOL = [
+    os.getenv("BSC_WSS_URL", "wss://bsc-rpc.publicnode.com"),
+    "wss://bsc.drpc.org",
+    "wss://bsc-ws-node.nariox.org:443",
+    "wss://bnb-chain.wss.run",
+]
 
-# HTTP Node for ON-CHAIN CONTRACT CHECKS & SIMULATIONS
 BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-dataseed1.binance.org/")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
@@ -41,14 +44,34 @@ ERC165_ABI = [
     }
 ]
 
+BALANCE_ABI = [
+    {
+        "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view", "type": "function"
+    }
+]
+
 ERC721_INTERFACE_ID = "0x80ac58cd"
 ERC1155_INTERFACE_ID = "0xd9b67a26"
 
 DB_FILE = "agentic_mints.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Independent Async HTTP Web3 instance for queries
 w3_http = AsyncWeb3(AsyncHTTPProvider(BSC_HTTP_URL))
+
+current_wss_index = 0
+
+def get_active_wss_endpoint() -> str:
+    return BSC_WSS_POOL[current_wss_index % len(BSC_WSS_POOL)]
+
+def rotate_wss_endpoint() -> str:
+    global current_wss_index
+    current_wss_index += 1
+    next_endpoint = get_active_wss_endpoint()
+    logging.info(f"Switched active WebSocket RPC to: {next_endpoint}")
+    return next_endpoint
 
 # ==========================================
 # PERSISTENT DATABASE
@@ -83,8 +106,26 @@ def mark_as_notified(address: str):
 # ==========================================
 # ON-CHAIN CHECKS OVER HTTP RPC
 # ==========================================
+async def already_owns_nft(contract_address: str) -> bool:
+    """Checks on-chain if MY_AGENTIC_WALLET already holds balance in target contract."""
+    try:
+        checksum_target = w3_http.to_checksum_address(contract_address)
+        checksum_wallet = w3_http.to_checksum_address(MY_AGENTIC_WALLET)
+        
+        contract = w3_http.eth.contract(address=checksum_target, abi=BALANCE_ABI)
+        balance = await contract.functions.balanceOf(checksum_wallet).call()
+        
+        if balance > 0:
+            logging.info(f"Skipped {contract_address}: Wallet already holds {balance} NFT(s).")
+            return True
+    except Exception as e:
+        logging.debug(f"balanceOf check skipped for {contract_address}: {e}")
+        return False
+        
+    return False
+
 async def verify_is_nft_contract(contract_address: str) -> tuple[bool, str]:
-    """Uses HTTP RPC to verify ERC-721 / ERC-1155 compliance without touching WebSocket socket."""
+    """Verifies ERC-721 / ERC-1155 standard compliance."""
     checksum_target = w3_http.to_checksum_address(contract_address)
     
     try:
@@ -116,13 +157,12 @@ async def verify_is_nft_contract(contract_address: str) -> tuple[bool, str]:
     return False, "Non-NFT"
 
 async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, str, str]:
-    """Uses HTTP RPC for dual-wallet eth_call simulations."""
+    """Dual-wallet simulation (Agentic wallet succeeds, control wallet reverts)."""
     checksum_target = w3_http.to_checksum_address(contract_address)
     checksum_agentic = w3_http.to_checksum_address(MY_AGENTIC_WALLET)
     checksum_control = w3_http.to_checksum_address(CONTROL_WALLET_NO_ID)
 
     for fn in MINT_FUNCTIONS:
-        # Step A: Agentic Wallet must succeed
         agentic_success = False
         try:
             tx_agentic = {"from": checksum_agentic, "to": checksum_target, "value": 0, "data": fn["data"]}
@@ -134,7 +174,6 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
         if not agentic_success:
             continue
 
-        # Step B: Control Wallet must revert
         control_success = False
         try:
             tx_control = {"from": checksum_control, "to": checksum_target, "value": 0, "data": fn["data"]}
@@ -152,7 +191,7 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
 # TELEGRAM NOTIFICATIONS
 # ==========================================
 async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str):
-    agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB. execute it, if it preview clearly and would return a ERC-721 token"
+    agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB."
 
     message = (
         f"🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨\n\n"
@@ -186,16 +225,21 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
 # ASYNCHRONOUS WORKER PROCESSOR
 # ==========================================
 async def process_contract_candidate(http_client: httpx.AsyncClient, contract_address: str, tx_hash: str):
-    """Processes candidate in background task without blocking the WebSocket listener."""
+    """Processes contract candidate with ownership pre-filtering."""
     if is_already_notified(contract_address):
         return
 
-    # Check NFT standard over HTTP
+    # 1. Check if contract is an NFT standard
     is_nft, nft_standard = await verify_is_nft_contract(contract_address)
     if not is_nft:
         return
 
-    # Run dual simulation over HTTP
+    # 2. CHECK IF WALLET ALREADY HOLDS THIS NFT
+    if await already_owns_nft(contract_address):
+        mark_as_notified(contract_address)
+        return
+
+    # 3. Dual-wallet simulation
     is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(contract_address)
     if is_exclusive:
         mark_as_notified(contract_address)
@@ -204,13 +248,12 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 # ==========================================
 # WEBSOCKET EVENT LISTENER
 # ==========================================
-async def listen_onchain():
+async def listen_onchain(wss_url: str):
     init_db()
-    logging.info("Connecting to BSC WebSocket Node...")
+    logging.info(f"Connecting to BSC WebSocket RPC: {wss_url}")
 
-    # Configure WebSocket provider with custom keepalive options
     ws_provider = WebSocketProvider(
-        BSC_WSS_URL,
+        wss_url,
         websocket_kwargs={
             "ping_interval": 20,
             "ping_timeout": 20,
@@ -220,7 +263,7 @@ async def listen_onchain():
 
     async with httpx.AsyncClient() as http_client:
         async with AsyncWeb3(ws_provider) as w3_ws:
-            logging.info("Connected to BSC WebSocket. Streaming mint logs...")
+            logging.info(f"Connected to {wss_url}. Streaming mint logs...")
 
             await w3_ws.eth.subscribe(
                 "logs",
@@ -239,26 +282,25 @@ async def listen_onchain():
                     tx_hash = result.get("transactionHash", "").hex()
 
                     if contract_address and not is_already_notified(contract_address):
-                        # Spawn background task to process event asynchronously
                         asyncio.create_task(process_contract_candidate(http_client, contract_address, tx_hash))
 
                 except Exception as e:
                     logging.error(f"Subscription event error: {e}")
 
+# ==========================================
+# MAIN LOOP WITH AUTOMATIC FAILOVER
+# ==========================================
 async def main():
     while True:
+        current_endpoint = get_active_wss_endpoint()
         try:
-            await listen_onchain()
+            await listen_onchain(current_endpoint)
         except Exception as e:
-            logging.error(f"WebSocket connection dropped ({e}). Reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
+            logging.warning(f"WebSocket endpoint '{current_endpoint}' failed ({e}).")
+            next_endpoint = rotate_wss_endpoint()
+            await asyncio.sleep(3)
 
 if __name__ == "__main__":
     asyncio.run(main())
-          await listen_onchain()
-        except Exception as e:
-            logging.error(f"WebSocket dropped ({e}). Reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
-
-if __name__ == "__main__":
+me__ == "__main__":
     asyncio.run(main())

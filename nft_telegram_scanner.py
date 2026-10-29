@@ -22,11 +22,14 @@ except ImportError:
 # CONFIGURATION & RPC POOLS
 # ==========================================
 BSC_WSS_POOL = [
-    os.getenv("BSC_WSS_URL", "wss://bsc-rpc.publicnode.com"),
-    "wss://bsc.drpc.org",
-    "wss://bsc-ws-node.nariox.org:443",
-    "wss://bnb-chain.wss.run",
+    os.getenv("BSC_WSS_URL", "wss://bsc-mainnet.nodereal.io/ws/v1/6a254628001a4daab023c41cea7e686c"),
+    "wss://bnb-mainnet.g.alchemy.com/v2/alch_VKpuhQjbfjUDGyyc0Ntwc",
+    "wss://tiniest-necessary-mountain.bsc.quiknode.pro/8d4b8e3bbbe17df68ca7a1bd32f48b67324a538a/",
+    "wss://bsc-mainnet.core.chainstack.com/301d34f2b36b95a1a7d0632c072cbb0b",
+    "wss://rpc-bsc.blockmachine.io",
+    "wss://bnb-chain.wss.run"
 ]
+
 
 BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-dataseed1.binance.org/")
 

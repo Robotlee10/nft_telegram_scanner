@@ -1,0 +1,16 @@
+# Environment configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Runtime data
+agentic_mints.db

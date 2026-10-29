@@ -246,23 +246,31 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     passed_count = 0
     results = {}
 
-       # CHECK 1: Keyless On-Chain Mint Activity Check (Hardened)
+    # CHECK 1: Stricter On-Chain Mint Velocity & Unique Minters
     try:
         latest_block = await w3_http.eth.block_number
-        from_block = max(0, latest_block - 1000) # Shorter safer range
+        from_block = max(0, latest_block - 1000)
         logs = await w3_http.eth.get_logs({
             "address": checksum_target,
             "topics": [ERC721_TRANSFER_TOPIC, ZERO_ADDRESS_TOPIC],
             "fromBlock": from_block
         })
-        if len(logs) >= 0:
-            results["1_activity"] = f"✅ On-Chain Activity ({len(logs)} transfers)"
+        
+        # Extract unique minter addresses (topic[2] is the recipient of the ERC-721 transfer)
+        unique_minters = set(log["topics"][2].hex() for log in logs if len(log["topics"]) > 2)
+        total_mints = len(logs)
+        
+        # STRICTER RULE: Must have at least 5 total mints AND at least 3 unique minter wallets
+        if total_mints >= 5 and len(unique_minters) >= 3:
+            results["1_activity"] = f"✅ High Momentum ({total_mints} mints, {len(unique_minters)} minters)"
             passed_count += 1
+        elif total_mints > 0:
+            results["1_activity"] = f"⚠️ Low Velocity ({total_mints} mints, {len(unique_minters)} minters)"
         else:
-            results["1_activity"] = "⚠️ Low Initial Activity"
+            results["1_activity"] = "❌ No Mint Activity Found"
     except Exception:
-        results["1_activity"] = "✅ Initialized (Activity Tracked)"
-        passed_count += 1
+        results["1_activity"] = "⚠️ Activity Check Error"
+
 
     # CHECK 2: Metadata & Asset Integrity (tokenURI)
     try:

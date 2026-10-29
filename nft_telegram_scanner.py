@@ -158,11 +158,21 @@ async def send_qr_to_telegram(http_client: httpx.AsyncClient):
         pairing_url = ""
         try:
             payload = json.loads(out_str)
-            pairing_url = payload.get("pairing_url", "")
+            pairing_url = payload.get("pairing_url") or payload.get("qr_url") or ""
         except Exception:
-            url_match = re.search(r"https?://[^\s]+", out_str)
-            pairing_url = url_match.group(0) if url_match else "https://agentic.binance.com/pair"
+            pass
 
+        # Specifically extract app.binance.com/uni-qr links
+        if not pairing_url or "uni-qr" not in pairing_url:
+            url_match = re.search(r"https://app\.binance\.com/uni-qr/[a-zA-Z0-9]+", out_str)
+            if url_match:
+                pairing_url = url_match.group(0)
+
+        if not pairing_url:
+            logging.error(f"Could not extract valid uni-qr link from output: {out_str[:200]}")
+            return
+
+        # Generate QR image in memory from the uni-qr link
         qr = qrcode.QRCode(version=1, box_size=10, border=4)
         qr.add_data(pairing_url)
         qr.make(fit=True)
@@ -175,7 +185,7 @@ async def send_qr_to_telegram(http_client: httpx.AsyncClient):
         caption = (
             "📱 <b>BINANCE AGENTIC WALLET RE-AUTHENTICATION</b>\n\n"
             "Scan this QR code in your Binance App to authorize cloud auto-minting.\n\n"
-            f"🔗 <b>Direct Pairing Link:</b> <a href='{pairing_url}'>Click to Open in Binance App</a>"
+            f"🔗 <b>Open Binance App:</b> <a href='{pairing_url}'>{pairing_url}</a>"
         )
 
         reply_markup = {
@@ -195,7 +205,7 @@ async def send_qr_to_telegram(http_client: httpx.AsyncClient):
 
         res = await http_client.post(url, data=data, files=files, timeout=15.0)
         if res.status_code == 200:
-            logging.info("Pairing QR successfully sent to Telegram.")
+            logging.info(f"Pairing QR successfully sent to Telegram: {pairing_url}")
     except Exception as e:
         logging.error(f"Failed generating/sending QR code: {e}")
 

@@ -491,6 +491,9 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
     
     ACTIVE_PROCESSING.add(addr)
     try:
+        # Give HTTP provider 1.5 seconds to ensure block indexing/receipt sync is ready
+        await asyncio.sleep(1.5)
+        
         # 1. Fetch record from local SQLite DB
         record = get_local_record(addr)
 

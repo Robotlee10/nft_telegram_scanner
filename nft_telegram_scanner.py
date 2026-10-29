@@ -25,6 +25,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET", "0xYourBinanceAgenticWalletAddress")
 CONTROL_WALLET_NO_ID = os.getenv("CONTROL_WALLET_NO_ID", "0x0000000000000000000000000000000000000001")
 
+# Standard On-Chain Topics
 ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 ZERO_ADDRESS_TOPIC = "0x0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -35,6 +36,7 @@ MINT_FUNCTIONS = [
     {"name": "claim()", "data": "0x4e71d92d"}
 ]
 
+# ABIs for Inspections
 ERC165_ABI = [
     {
         "inputs": [{"internalType": "bytes4", "name": "interfaceId", "type": "bytes4"}],
@@ -53,8 +55,14 @@ BALANCE_ABI = [
     }
 ]
 
+METADATA_ABI = [
+    {"inputs": [{"internalType": "uint256", "name": "tokenId", "type": "uint256"}], "name": "tokenURI", "outputs": [{"internalType": "string", "name": "", "type": "string"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "contractURI", "outputs": [{"internalType": "string", "name": "", "type": "string"}], "stateMutability": "view", "type": "function"}
+]
+
 ERC721_INTERFACE_ID = "0x80ac58cd"
 ERC1155_INTERFACE_ID = "0xd9b67a26"
+ERC2981_ROYALTY_INTERFACE_ID = "0x2a55205a"
 
 DB_FILE = "agentic_mints.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -104,7 +112,118 @@ def mark_as_notified(address: str):
     conn.close()
 
 # ==========================================
-# ON-CHAIN CHECKS OVER HTTP RPC
+# 5 QUALITY CHECKS MODULE
+# ==========================================
+async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: str) -> dict:
+    """
+    Evaluates 5 indicators on the contract without blocking the alert.
+    Returns score breakdown.
+    """
+    checksum_target = w3_http.to_checksum_address(contract_address)
+    passed_count = 0
+    results = {}
+
+    # -----------------------------------------------------------
+    # CHECK 1: Secondary Market Liquidity (Element Market API)
+    # -----------------------------------------------------------
+    try:
+        url = f"https://api.element.market/openapi/v1/contract/stat?contract_address={contract_address}"
+        res = await http_client.get(url, timeout=4.0)
+        if res.status_code == 200:
+            data = res.json().get("data", {})
+            has_volume = float(data.get("volume", 0)) > 0 or float(data.get("floor_price", 0)) > 0
+            if has_volume:
+                results["1_market"] = "✅ Active Bids / Volume Found"
+                passed_count += 1
+            else:
+                results["1_market"] = "⚠️ No Market Volume Yet"
+        else:
+            results["1_market"] = "⚠️ Market API Pending"
+    except Exception:
+        results["1_market"] = "⚠️ Market Unindexed"
+
+    # -----------------------------------------------------------
+    # CHECK 2: Metadata & Asset Integrity (tokenURI)
+    # -----------------------------------------------------------
+    try:
+        contract = w3_http.eth.contract(address=checksum_target, abi=METADATA_ABI)
+        uri = ""
+        try:
+            uri = await contract.functions.tokenURI(1).call()
+        except Exception:
+            try:
+                uri = await contract.functions.contractURI().call()
+            except Exception:
+                pass
+
+        if uri and ("ipfs://" in uri or "ar://" in uri or "http" in uri):
+            results["2_metadata"] = "✅ Valid IPFS/Arweave Metadata"
+            passed_count += 1
+        else:
+            results["2_metadata"] = "❌ Blank / Non-Standard Metadata"
+    except Exception:
+        results["2_metadata"] = "❌ Metadata Unreachable"
+
+    # -----------------------------------------------------------
+    # CHECK 3: Source Code Verification (BscScan Free Check)
+    # -----------------------------------------------------------
+    try:
+        url = f"https://api.bscscan.com/api?module=contract&action=getsourcecode&address={contract_address}"
+        res = await http_client.get(url, timeout=4.0)
+        if res.status_code == 200:
+            source_data = res.json().get("result", [{}])[0]
+            if source_data.get("SourceCode"):
+                results["3_source"] = "✅ Verified on BscScan"
+                passed_count += 1
+            else:
+                results["3_source"] = "❌ Unverified Source Code"
+        else:
+            results["3_source"] = "⚠️ BscScan Unverified"
+    except Exception:
+        results["3_source"] = "⚠️ Source Check Error"
+
+    # -----------------------------------------------------------
+    # CHECK 4: Unique Minter Velocity (Anti-Bot Farm Check)
+    # -----------------------------------------------------------
+    try:
+        logs = await w3_http.eth.get_logs({
+            "address": checksum_target,
+            "topics": [ERC721_TRANSFER_TOPIC, ZERO_ADDRESS_TOPIC],
+            "fromBlock": "latest"
+        })
+        # Extract unique minter receiver addresses
+        unique_minters = set(log["topics"][2].hex() for log in logs if len(log["topics"]) > 2)
+        if len(unique_minters) >= 2 or len(logs) < 3:
+            results["4_diversity"] = f"✅ Organic Demand ({len(unique_minters)} minters)"
+            passed_count += 1
+        else:
+            results["4_diversity"] = "❌ Bot Farm Concentration"
+    except Exception:
+        results["4_diversity"] = "✅ Single Mint Event"
+        passed_count += 1
+
+    # -----------------------------------------------------------
+    # CHECK 5: ERC-2981 Royalty Standard Support
+    # -----------------------------------------------------------
+    try:
+        contract_165 = w3_http.eth.contract(address=checksum_target, abi=ERC165_ABI)
+        has_royalty = await contract_165.functions.supportsInterface(bytes.fromhex(ERC2981_ROYALTY_INTERFACE_ID[2:])).call()
+        if has_royalty:
+            results["5_royalty"] = "✅ ERC-2981 Royalty Enabled"
+            passed_count += 1
+        else:
+            results["5_royalty"] = "❌ No ERC-2981 Standard"
+    except Exception:
+        results["5_royalty"] = "❌ Royalty Check Reverted"
+
+    return {
+        "score_str": f"{passed_count}/5 Passed",
+        "passed_count": passed_count,
+        "details": results
+    }
+
+# ==========================================
+# ON-CHAIN BASE CHECKS
 # ==========================================
 async def already_owns_nft(contract_address: str) -> bool:
     """Checks on-chain if MY_AGENTIC_WALLET already holds balance in target contract."""
@@ -190,8 +309,11 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
 # ==========================================
 # TELEGRAM NOTIFICATIONS
 # ==========================================
-async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str):
+async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict):
     agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB."
+
+    details = quality_report["details"]
+    quality_score = quality_report["score_str"]
 
     message = (
         f"🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨\n\n"
@@ -199,7 +321,13 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
         f"🎨 <b>NFT Standard:</b> ✅ {nft_standard}\n"
         f"🛡️ <b>Access Gate:</b> 🔒 Agentic ID Holders Only\n"
-        f"⚙️ <b>Function:</b> <code>{func_name}</code>\n"
+        f"⚙️ <b>Function:</b> <code>{func_name}</code>\n\n"
+        f"📊 <b>Quality Score:</b> <b>{quality_score}</b>\n"
+        f"1️⃣ <b>Market Bids:</b> {details.get('1_market')}\n"
+        f"2️⃣ <b>Metadata Integrity:</b> {details.get('2_metadata')}\n"
+        f"3️⃣ <b>Source Code:</b> {details.get('3_source')}\n"
+        f"4️⃣ <b>Minter Diversity:</b> {details.get('4_diversity')}\n"
+        f"5️⃣ <b>ERC-2981 Royalty:</b> {details.get('5_royalty')}\n\n"
         f"🔗 <b>BscScan:</b> https://bscscan.com/address/{contract}\n"
         f"⚡ <b>Detected TX:</b> https://bscscan.com/tx/{tx_hash}\n\n"
         f"🤖 <b>Direct Agent Command:</b>\n"
@@ -217,7 +345,7 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
     try:
         res = await http_client.post(url, json=payload, timeout=10.0)
         if res.status_code == 200:
-            logging.info(f"Alert sent for contract: {contract}")
+            logging.info(f"Alert sent for contract: {contract} (Score: {quality_score})")
     except Exception as e:
         logging.error(f"Failed sending alert: {e}")
 
@@ -225,7 +353,7 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
 # ASYNCHRONOUS WORKER PROCESSOR
 # ==========================================
 async def process_contract_candidate(http_client: httpx.AsyncClient, contract_address: str, tx_hash: str):
-    """Processes contract candidate with ownership pre-filtering."""
+    """Processes contract candidate with ownership pre-filtering and quality evaluation."""
     if is_already_notified(contract_address):
         return
 
@@ -243,7 +371,12 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
     is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(contract_address)
     if is_exclusive:
         mark_as_notified(contract_address)
-        await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash)
+        
+        # Run 5 Quality Checks (Non-blocking inspection)
+        quality_report = await run_quality_checks(http_client, contract_address)
+        
+        # Send Telegram alert regardless of score
+        await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report)
 
 # ==========================================
 # WEBSOCKET EVENT LISTENER
@@ -302,4 +435,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

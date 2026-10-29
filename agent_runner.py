@@ -1,5 +1,6 @@
 import sys
 import json
+import re
 import asyncio
 import httpx
 from pathlib import Path
@@ -7,17 +8,30 @@ from pathlib import Path
 SESSION_FILE = Path(".agentic_session.json")
 
 async def pair():
-    """Requests a pairing URL from the Binance Agentic Wallet API."""
+    """Fetches or parses the official Binance app.binance.com/uni-qr pairing link."""
     async with httpx.AsyncClient() as client:
         try:
-            # Connect to the Binance Agentic Wallet session endpoint
+            # Example request to session endpoint
             res = await client.post("https://agentic.binance.com/api/v1/session/create", json={"client": "cloud_bot"}, timeout=10.0)
             if res.status_code == 200:
-                print(json.dumps(res.json()))
+                data = res.json()
+                pairing_url = data.get("pairing_url") or data.get("qr_url")
+                
+                # Ensure link follows Binance Universal QR format
+                if pairing_url and "uni-qr" in pairing_url:
+                    print(json.dumps({"pairing_url": pairing_url}))
+                    return
+
+            # If raw output contains a uni-qr code string
+            raw_text = res.text
+            match = re.search(r"https://app\.binance\.com/uni-qr/[a-zA-Z0-9]+", raw_text)
+            if match:
+                print(json.dumps({"pairing_url": match.group(0)}))
             else:
-                print(json.dumps({"pairing_url": "https://agentic.binance.com/pair"}))
+                print(json.dumps({"error": "No valid uni-qr link found"}))
+
         except Exception as e:
-            print(json.dumps({"pairing_url": "https://agentic.binance.com/pair", "error": str(e)}))
+            print(json.dumps({"error": str(e)}))
 
 async def write(contract: str, func_name: str, value: int):
     """Triggers the contract execution using the saved session token."""
@@ -48,3 +62,4 @@ if __name__ == "__main__":
         func_arg = sys.argv[sys.argv.index("--func") + 1]
         value_arg = int(sys.argv[sys.argv.index("--value") + 1])
         asyncio.run(write(contract_arg, func_arg, value_arg))
+        

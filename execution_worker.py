@@ -16,6 +16,9 @@ from typing import Optional, Tuple
 
 import httpx
 from web3 import Web3
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES

@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from web3 import AsyncWeb3
 from web3.providers import WebSocketProvider, AsyncHTTPProvider
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 # ==========================================
 # 1. LOGGING CONFIGURATION & NOISE MUTE

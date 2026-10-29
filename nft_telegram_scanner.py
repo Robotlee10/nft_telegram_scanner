@@ -160,10 +160,12 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     except Exception:
         results["2_metadata"] = "❌ Metadata Unreachable"
 
-    # CHECK 3: Source Code Verification (BscScan Free Check with Follow Redirects)
+        # -----------------------------------------------------------
+    # CHECK 3: Source Code Verification (Etherscan V2 for BSC)
+    # -----------------------------------------------------------
     try:
-        url = f"https://api.bscscan.com/api?module=contract&action=getsourcecode&address={contract_address}"
-        res = await http_client.get(url, timeout=5.0, follow_redirects=True)
+        url = f"https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address={contract_address}"
+        res = await http_client.get(url, timeout=5.0)
         if res.status_code == 200:
             source_data = res.json().get("result", [{}])[0]
             if source_data.get("SourceCode"):

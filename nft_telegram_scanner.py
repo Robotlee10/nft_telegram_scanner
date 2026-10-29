@@ -11,6 +11,13 @@ from pathlib import Path
 from web3 import AsyncWeb3
 from web3.providers import WebSocketProvider, AsyncHTTPProvider
 
+# Supabase Integration Import
+try:
+    from supabase import create_client, Client
+except ImportError:
+    create_client = None
+    Client = None
+
 # ==========================================
 # CONFIGURATION & RPC POOLS
 # ==========================================
@@ -28,6 +35,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
 MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET", "0xYourBinanceAgenticWalletAddress")
 CONTROL_WALLET_NO_ID = os.getenv("CONTROL_WALLET_NO_ID", "0x0000000000000000000000000000000000000001")
+
+# Supabase Environment Variables
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+supabase: Client | None = None
+if SUPABASE_URL and SUPABASE_KEY and create_client:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logging.info("Supabase client initialized successfully.")
+    except Exception as e:
+        logging.error(f"Failed to initialize Supabase client: {e}")
 
 # Standard On-Chain Topics
 ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -86,7 +105,7 @@ def rotate_wss_endpoint() -> str:
     return next_endpoint
 
 # ==========================================
-# PERSISTENT DATABASE
+# PERSISTENT DUAL-DATABASE (SUPABASE + SQLITE)
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -101,19 +120,58 @@ def init_db():
     conn.close()
 
 def is_already_notified(address: str) -> bool:
+    addr = address.lower()
+
+    # 1. Fast Local SQLite Check
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM notified_contracts WHERE address = ?", (address.lower(),))
+    cursor.execute("SELECT 1 FROM notified_contracts WHERE address = ?", (addr,))
     row = cursor.fetchone()
     conn.close()
-    return row is not None
+    if row is not None:
+        return True
 
-def mark_as_notified(address: str):
+    # 2. Remote Supabase Check
+    if supabase:
+        try:
+            res = supabase.table("notified_contracts").select("address").eq("address", addr).execute()
+            if res.data and len(res.data) > 0:
+                # Sync back to local SQLite cache
+                conn = sqlite3.connect(DB_FILE)
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR IGNORE INTO notified_contracts (address) VALUES (?)", (addr,))
+                conn.commit()
+                conn.close()
+                return True
+        except Exception as e:
+            logging.error(f"Supabase read error for {addr}: {e}")
+
+    return False
+
+def mark_as_notified(address: str, nft_standard: str = "", score: str = "", func_name: str = "", tx_hash: str = ""):
+    addr = address.lower()
+
+    # 1. Record in local SQLite cache
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO notified_contracts (address) VALUES (?)", (address.lower(),))
+    cursor.execute("INSERT OR IGNORE INTO notified_contracts (address) VALUES (?)", (addr,))
     conn.commit()
     conn.close()
+
+    # 2. Record/Upsert in Supabase Dashboard
+    if supabase:
+        try:
+            payload = {
+                "address": addr,
+                "nft_standard": nft_standard,
+                "quality_score": score,
+                "function_name": func_name,
+                "tx_hash": tx_hash
+            }
+            supabase.table("notified_contracts").upsert(payload).execute()
+            logging.info(f"Saved contract {addr} to Supabase dashboard.")
+        except Exception as e:
+            logging.error(f"Failed writing {addr} to Supabase: {e}")
 
 # ==========================================
 # ON-CHAIN CHECKS MODULE
@@ -347,7 +405,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 
     # 2. Ownership Check (Must NOT already hold balance in wallet)
     if await already_owns_nft(contract_address):
-        mark_as_notified(contract_address)
+        mark_as_notified(contract_address, nft_standard=nft_standard)
         return
 
     # 3. Exclusivity Test (Must be 0 BNB strictly for Agentic ID holders)
@@ -355,8 +413,17 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
     if not is_exclusive:
         return
 
-    mark_as_notified(contract_address)
     quality_report = await run_quality_checks(http_client, contract_address)
+    
+    # Record to both local SQLite and Supabase dashboard
+    mark_as_notified(
+        address=contract_address,
+        nft_standard=nft_standard,
+        score=quality_report["score_str"],
+        func_name=func_name,
+        tx_hash=tx_hash
+    )
+    
     await send_telegram_alert(http_client, contract_address, nft_standard, func_name, tx_hash, quality_report)
 
 # ==========================================
@@ -416,4 +483,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
+                     

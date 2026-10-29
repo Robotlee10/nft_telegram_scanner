@@ -373,7 +373,6 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
             logging.info(f"Alert sent for contract: {contract} (Reminder: {is_reminder})")
     except Exception as e:
         logging.error(f"Failed sending alert: {e}")
-)
 
 # ==========================================
 # PIPELINE WITH LOCAL CACHE & QUALITY FILTER FOR REMINDERS

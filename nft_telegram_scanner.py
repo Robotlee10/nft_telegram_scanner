@@ -87,7 +87,7 @@ ERC721_INTERFACE_ID = "0x80ac58cd"
 ERC1155_INTERFACE_ID = "0xd9b67a26"
 ERC2981_ROYALTY_INTERFACE_ID = "0x2a55205a"
 
-DB_FILE = "agentic_mints.db"
+DB_FILE = Path(__file__).resolve().with_name("agentic_mints.db")
 
 w3_http = AsyncWeb3(AsyncHTTPProvider(BSC_HTTP_URL))
 
@@ -117,6 +117,20 @@ def init_db():
             tx_hash TEXT,
             minted BOOLEAN DEFAULT 0,
             last_notified_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contract_address TEXT NOT NULL,
+            function_name TEXT NOT NULL,
+            quality_score INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'pending',
+            tx_hash TEXT,
+            order_id TEXT,
+            error_log TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            executed_at TIMESTAMP
         )
     """)
     conn.commit()
@@ -160,6 +174,38 @@ def save_local_record(address: str, nft_standard: str, function_name: str, tx_ha
         logging.info(f"Saved contract {address} to local SQLite cache.")
     except Exception as e:
         logging.error(f"SQLite write error for {address}: {e}")
+
+def queue_auto_mint(address: str, function_name: str, quality_score: int):
+    if quality_score < 3:
+        return
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        existing = conn.execute(
+            "SELECT id FROM mints WHERE contract_address = ? AND function_name = ? LIMIT 1",
+            (address.lower(), function_name)
+        ).fetchone()
+        if existing:
+            return
+
+        conn.execute(
+            """
+            INSERT INTO mints (contract_address, function_name, quality_score)
+            VALUES (?, ?, ?)
+            """,
+            (address.lower(), function_name, quality_score)
+        )
+        conn.commit()
+        logging.info(
+            f"Queued contract {address} for reviewed mint execution "
+            f"(quality {quality_score}/7)."
+        )
+    except sqlite3.Error as e:
+        logging.error(f"Failed to queue mint for {address}: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 # ==========================================
 # ON-CHAIN CHECKS MODULE
@@ -467,6 +513,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 
             # ONLY send the reminder if it passes 3 or more quality checks (>= 3/7)
             if quality_report["passed_count"] >= 3:
+                queue_auto_mint(addr, record["function_name"], quality_report["passed_count"])
                 await send_telegram_alert(
                     http_client,
                     contract=addr,
@@ -499,6 +546,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         quality_report = await run_quality_checks(http_client, addr)
 
         save_local_record(addr, nft_standard, func_name, tx_hash, minted=False)
+        queue_auto_mint(addr, func_name, quality_report["passed_count"])
         
         # Notify for ALL valid initial NFT detections with score included
         await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)

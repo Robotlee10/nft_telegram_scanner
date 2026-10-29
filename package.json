@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "@binance/agentic-wallet": "1.12.0"
+  }
+}

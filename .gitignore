@@ -11,6 +11,7 @@ __pycache__/
 .venv/
 venv/
 env/
+node_modules/
 
 # Runtime data
 agentic_mints.db

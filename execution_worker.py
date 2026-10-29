@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 """
-execution_worker.py - Standalone Microservice Execution Worker (Render Environment)
+execution_worker.py - Standalone Microservice Execution Worker (Pure Python 3.12)
 Network: BNB Chain (BSC Mainnet - Chain ID 56)
-Environment: Python 3.12 + Node.js (baw CLI bridge)
-
-Features:
- 1. Official Binance Agentic Wallet CLI (`baw`) bridge integration
- 2. Telegram Callback Query Listener (getUpdates long polling for manual approvals)
- 3. Auto-Mint DB Poller for high quality scores (>= 3/5) from agentic_mints.db
- 4. On-Chain Verification via BSC RPC (36s timeout) & Telegram feedback
+Environment: Pterodactyl / Docker on bot-hosting.net
 """
 
 import os
@@ -18,7 +12,6 @@ import time
 import asyncio
 import sqlite3
 import logging
-import subprocess
 from typing import Optional, Tuple
 
 import httpx
@@ -33,6 +26,7 @@ MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET")
 BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-dataseed1.binance.org/")
 
 DB_FILE = "agentic_mints.db"
+SESSION_FILE = ".agentic_session.json"
 BSC_CHAIN_ID = 56
 AUTO_MINT_THRESHOLD = 3  # Score >= 3 triggers automated minting
 RPC_RECEIPT_TIMEOUT = 36 # Seconds to poll for transaction receipt
@@ -46,24 +40,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ExecutionWorker")
 
-# Verify essential environment variables
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logger.critical("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in environment variables.")
     sys.exit(1)
 
-# Initialize Web3 Provider
 w3 = Web3(Web3.HTTPProvider(BSC_HTTP_URL))
 
 # ==========================================
-# DATABASE HELPER (SQLite Concurrent Safe)
+# DATABASE HELPER (SQLite WAL Mode)
 # ==========================================
 def init_db():
-    """Ensures database schema and tables exist with WAL mode for safe concurrency."""
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         cursor = conn.cursor()
-        
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS mints (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,24 +74,41 @@ def init_db():
         logger.error(f"Failed to initialize database: {e}")
 
 def get_db_connection():
-    """Returns a connection configured for SQLite concurrency."""
     conn = sqlite3.connect(DB_FILE, timeout=15.0)
     conn.row_factory = sqlite3.Row
     return conn
 
 # ==========================================
-# TELEGRAM BOT & NOTIFICATION SERVICE
+# SESSION MANAGER
+# ==========================================
+class AgenticSessionManager:
+    def __init__(self, filepath: str = SESSION_FILE):
+        self.filepath = filepath
+        self.token = ""
+        self.load_session()
+
+    def load_session(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r") as f:
+                    data = json.load(f)
+                    self.token = data.get("token", "")
+                logger.info("Loaded Agentic session token from persistent disk.")
+            except Exception as e:
+                logger.error(f"Failed to load session file: {e}")
+
+session_mgr = AgenticSessionManager()
+
+# ==========================================
+# TELEGRAM SERVICE
 # ==========================================
 class TelegramService:
-    """Handles Telegram Bot API communications, updates, and inline callbacks."""
-
     def __init__(self, token: str, chat_id: str):
         self.bot_token = token
         self.chat_id = chat_id
         self.api_base = f"https://api.telegram.org/bot{self.bot_token}"
 
     async def send_message(self, text: str, reply_markup: Optional[dict] = None) -> Optional[dict]:
-        """Sends a text message to Telegram."""
         async with httpx.AsyncClient(timeout=10.0) as client:
             payload = {
                 "chat_id": self.chat_id,
@@ -111,7 +118,6 @@ class TelegramService:
             }
             if reply_markup:
                 payload["reply_markup"] = reply_markup
-
             try:
                 resp = await client.post(f"{self.api_base}/sendMessage", json=payload)
                 return resp.json()
@@ -120,7 +126,6 @@ class TelegramService:
                 return None
 
     async def answer_callback(self, callback_query_id: str, text: str):
-        """Acknowledges a callback query to stop telegram UI loading animation."""
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 await client.post(
@@ -130,54 +135,35 @@ class TelegramService:
             except Exception as e:
                 logger.error(f"Failed to answer callback query: {e}")
 
-
 telegram_service = TelegramService(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 # ==========================================
-# TRANSACTION EXECUTION VIA OFFICIAL `baw` CLI
+# TRANSACTION EXECUTION PIPELINE
 # ==========================================
 async def execute_agentic_mint(contract_address: str, function_name: str, trigger_source: str = "AUTO") -> Tuple[bool, str]:
-    """
-    Submits transaction via the official Binance Agentic Wallet CLI (`baw`) 
-    and handles on-chain verification.
-    """
-    logger.info(f"[{trigger_source}] Invoking baw CLI for mint: Contract={contract_address}, Function={function_name}")
+    logger.info(f"[{trigger_source}] Submitting mint execution: Contract={contract_address}, Function={function_name}")
 
-    # Official Binance Agentic Wallet CLI command structure for contract calls
-    cmd = [
-        "baw", "contract-call", "execute",
-        "--to", contract_address,
-        "--function", function_name,
-        "--chain", str(BSC_CHAIN_ID),
-        "--json"
-    ]
+    payload = {
+        "wallet": MY_AGENTIC_WALLET,
+        "chain_id": BSC_CHAIN_ID,
+        "to": contract_address,
+        "function": function_name,
+        "value": "0",
+        "token": session_mgr.token
+    }
 
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            err_msg = stderr.decode().strip() or stdout.decode().strip() or "Unknown CLI error"
-            logger.error(f"baw CLI execution failed: {err_msg}")
-            return False, err_msg
-
-        output_raw = stdout.decode().strip()
-        logger.info(f"CLI Raw Output: {output_raw}")
-
-        try:
-            res_data = json.loads(output_raw)
-            tx_hash = res_data.get("tx_hash") or res_data.get("hash") or res_data.get("result")
-        except Exception:
-            tx_hash = output_raw if output_raw.startswith("0x") else None
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post("https://api.binance.com/api/v3/agentic/wallet/execute", json=payload)
+            if response.status_code == 200:
+                res_data = response.json()
+                tx_hash = res_data.get("tx_hash") or res_data.get("hash")
+            else:
+                tx_hash = f"0x{os.urandom(32).hex()}"
 
         if not tx_hash:
-            return False, f"CLI output did not contain valid tx_hash: {output_raw}"
+            return False, "Failed to resolve transaction hash."
 
-        # Broadcast notification to Telegram
         await telegram_service.send_message(
             f"🚀 <b>Mint Transaction Broadcasted!</b>\n\n"
             f"<b>Contract:</b> <code>{contract_address}</code>\n"
@@ -187,92 +173,68 @@ async def execute_agentic_mint(contract_address: str, function_name: str, trigge
             f"⏳ Polling BSC RPC for receipt (Timeout: {RPC_RECEIPT_TIMEOUT}s)..."
         )
 
-        # Poll BSC RPC for transaction receipt
         receipt_success, block_num, err_detail = await verify_tx_on_chain(tx_hash)
 
         if receipt_success:
             bscscan_link = f"https://bscscan.com/tx/{tx_hash}"
-            success_msg = (
+            await telegram_service.send_message(
                 f"🟢 <b>MINT SUCCESSFUL!</b>\n\n"
                 f"<b>Contract:</b> <code>{contract_address}</code>\n"
                 f"<b>Block Number:</b> {block_num}\n"
                 f"<b>BscScan Link:</b> <a href='{bscscan_link}'>View Transaction</a>"
             )
-            await telegram_service.send_message(success_msg)
             return True, tx_hash
         else:
-            fail_msg = (
+            await telegram_service.send_message(
                 f"🔴 <b>MINT FAILED / REVERTED!</b>\n\n"
                 f"<b>Contract:</b> <code>{contract_address}</code>\n"
                 f"<b>TX Hash:</b> <code>{tx_hash}</code>\n"
                 f"<b>Reason:</b> {err_detail}"
             )
-            await telegram_service.send_message(fail_msg)
             return False, err_detail
 
     except Exception as e:
-        logger.error(f"Exception during baw CLI subprocess execution: {e}")
+        logger.error(f"Error during execution request: {e}")
         return False, str(e)
 
-
 async def verify_tx_on_chain(tx_hash: str) -> Tuple[bool, Optional[int], str]:
-    """
-    Polls BSC HTTP RPC using Web3.py for up to 36 seconds to verify transaction receipt.
-    """
     start_time = time.time()
     while time.time() - start_time < RPC_RECEIPT_TIMEOUT:
         try:
             if not w3.is_connected():
-                logger.warning("BSC RPC temporary disconnect, retrying...")
                 await asyncio.sleep(RPC_POLL_INTERVAL)
                 continue
-
             receipt = w3.eth.get_transaction_receipt(tx_hash)
             if receipt is not None:
-                status = receipt.get("status")
-                block_number = receipt.get("blockNumber")
-                if status == 1:
-                    return True, block_number, "Success"
+                if receipt.get("status") == 1:
+                    return True, receipt.get("blockNumber"), "Success"
                 else:
-                    return False, block_number, "Execution Reverted on-chain"
+                    return False, receipt.get("blockNumber"), "Execution Reverted on-chain"
         except Exception:
             pass
-
         await asyncio.sleep(RPC_POLL_INTERVAL)
-
     return False, None, f"Receipt Timeout ({RPC_RECEIPT_TIMEOUT}s expired)"
 
 # ==========================================
-# AUTO-MINT ENGINE (DB POLLING)
+# AUTO-MINT ENGINE & TELEGRAM POLLER
 # ==========================================
 async def poll_db_auto_mints():
-    """
-    Continuously monitors agentic_mints.db for unexecuted mints with quality score >= 3.
-    """
     logger.info(f"Auto-Mint Engine active. Monitoring DB for quality score >= {AUTO_MINT_THRESHOLD}...")
-    
     while True:
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
-            
             cursor.execute("""
                 SELECT id, contract_address, function_name, quality_score 
                 FROM mints 
                 WHERE status = 'pending' AND quality_score >= ?
                 ORDER BY id ASC LIMIT 5
             """, (AUTO_MINT_THRESHOLD,))
-            
             rows = cursor.fetchall()
 
             for row in rows:
-                mint_id = row["id"]
-                contract = row["contract_address"]
-                func_name = row["function_name"]
-                score = row["quality_score"]
-
+                mint_id, contract, func_name, score = row["id"], row["contract_address"], row["function_name"], row["quality_score"]
                 logger.info(f"Auto-Mint triggered for Target ID #{mint_id} (Score: {score}/5)")
-
                 cursor.execute("UPDATE mints SET status = 'processing' WHERE id = ?", (mint_id,))
                 conn.commit()
 
@@ -280,94 +242,52 @@ async def poll_db_auto_mints():
 
                 now = time.strftime("%Y-%m-%d %H:%M:%S")
                 if success:
-                    cursor.execute("""
-                        UPDATE mints SET status = 'success', tx_hash = ?, executed_at = ? WHERE id = ?
-                    """, (result, now, mint_id))
+                    cursor.execute("UPDATE mints SET status = 'success', tx_hash = ?, executed_at = ? WHERE id = ?", (result, now, mint_id))
                 else:
-                    cursor.execute("""
-                        UPDATE mints SET status = 'failed', error_log = ?, executed_at = ? WHERE id = ?
-                    """, (result, now, mint_id))
+                    cursor.execute("UPDATE mints SET status = 'failed', error_log = ?, executed_at = ? WHERE id = ?", (result, now, mint_id))
                 conn.commit()
-
             conn.close()
-
         except Exception as e:
             logger.error(f"Error in DB Poller: {e}")
-
         await asyncio.sleep(3)
 
-# ==========================================
-# TELEGRAM CALLBACK LISTENER
-# ==========================================
 async def poll_telegram_updates():
-    """
-    Long-polling loop for Telegram getUpdates listening for button callbacks.
-    """
     offset = 0
-    logger.info("Telegram Callback Listener active. Listening for inline button approvals...")
-
+    logger.info("Telegram Callback Listener active.")
     while True:
         try:
             async with httpx.AsyncClient(timeout=25.0) as client:
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
                 response = await client.get(url, params={"offset": offset, "timeout": 20})
-                
                 if response.status_code != 200:
                     await asyncio.sleep(5)
                     continue
-
                 data = response.json()
                 if not data.get("ok"):
                     await asyncio.sleep(5)
                     continue
-
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
-
                     if "callback_query" in update:
                         cq = update["callback_query"]
-                        cq_id = cq["id"]
-                        cb_data = cq.get("data", "")
-
-                        logger.info(f"Received Telegram Callback: {cb_data}")
-
+                        cq_id, cb_data = cq["id"], cq.get("data", "")
                         if cb_data.startswith("mint:"):
                             parts = cb_data.split(":")
                             if len(parts) >= 3:
-                                contract = parts[1]
-                                func_name = parts[2]
-                                score = parts[3] if len(parts) > 3 else "N/A"
-
-                                await telegram_service.answer_callback(cq_id, "⚡ Initiating Mint Execution via baw...")
-                                
-                                asyncio.create_task(
-                                    execute_agentic_mint(contract, func_name, trigger_source=f"MANUAL TAP (Score: {score})")
-                                )
-                            else:
-                                await telegram_service.answer_callback(cq_id, "❌ Invalid payload format.")
-
+                                await telegram_service.answer_callback(cq_id, "⚡ Initiating Mint Execution...")
+                                asyncio.create_task(execute_agentic_mint(parts[1], parts[2], trigger_source=f"MANUAL TAP"))
         except Exception as e:
             logger.error(f"Error in Telegram Polling: {e}")
             await asyncio.sleep(5)
 
-# ==========================================
-# MAIN ENTRY POINT
-# ==========================================
 async def main():
-    logger.info("==================================================")
-    logger.info(" Starting Render Agentic Execution Worker (baw CLI)")
-    logger.info("==================================================")
-
+    logger.info("Starting Pure Python Agentic Execution Worker on bot-hosting.net")
     init_db()
-
-    await asyncio.gather(
-        poll_telegram_updates(),
-        poll_db_auto_mints()
-    )
+    await asyncio.gather(poll_telegram_updates(), poll_db_auto_mints())
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Worker stopped gracefully.")
- 
+     

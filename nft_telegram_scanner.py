@@ -395,86 +395,95 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         logging.error(f"Failed sending alert: {e}")
 
 # ==========================================
-# PIPELINE WITH 1-HOUR UNMINTED CHECK
+# CONCURRENT DUPLICATE PREVENTION LOCK
 # ==========================================
+ACTIVE_PROCESSING = set()
+
 async def process_contract_candidate(http_client: httpx.AsyncClient, contract_address: str, tx_hash: str):
     addr = contract_address.lower()
 
-    # 1. Fetch record from Supabase
-    record = await fetch_supabase_record(http_client, addr)
+    # Prevent concurrent duplicate processing for the same contract in flight
+    if addr in ACTIVE_PROCESSING:
+        return
+    
+    ACTIVE_PROCESSING.add(addr)
+    try:
+        # 1. Fetch record from Supabase
+        record = await fetch_supabase_record(http_client, addr)
 
-    if record:
-        # If already marked as minted, drop candidate immediately
-        if record.get("minted") is True:
-            return
-
-        # Check timestamp elapsed since last notification
-        last_notified_str = record.get("last_notified_at")
-        if last_notified_str:
-            try:
-                # Parse ISO timestamp
-                last_dt = datetime.fromisoformat(last_notified_str.replace("Z", "+00:00"))
-                now_dt = datetime.now(timezone.utc)
-                elapsed_seconds = (now_dt - last_dt).total_seconds()
-
-                # Ignore candidate if notified less than 1 hour (3600 seconds) ago
-                if elapsed_seconds < 3600:
-                    return
-            except Exception as e:
-                logging.debug(f"Timestamp parse error: {e}")
+        if record:
+            # If already marked as minted, drop candidate immediately
+            if record.get("minted") is True:
                 return
 
-        # Passed 1 hour without being minted -> Trigger Re-Notification Alert!
+            # Check timestamp elapsed since last notification
+            last_notified_str = record.get("last_notified_at")
+            if last_notified_str:
+                try:
+                    last_dt = datetime.fromisoformat(last_notified_str.replace("Z", "+00:00"))
+                    now_dt = datetime.now(timezone.utc)
+                    elapsed_seconds = (now_dt - last_dt).total_seconds()
+
+                    # Ignore candidate if notified less than 1 hour (3600 seconds) ago
+                    if elapsed_seconds < 3600:
+                        return
+                except Exception as e:
+                    logging.debug(f"Timestamp parse error: {e}")
+                    return
+
+            # Passed 1 hour without being minted -> Trigger Re-Notification Alert!
+            quality_report = await run_quality_checks(http_client, addr)
+            
+            update_payload = {
+                "address": addr,
+                "last_notified_at": datetime.now(timezone.utc).isoformat()
+            }
+            await upsert_supabase_record(http_client, update_payload)
+
+            await send_telegram_alert(
+                http_client,
+                contract=addr,
+                nft_standard=record.get("nft_standard", "ERC-721"),
+                func_name=record.get("function_name", "mint(1)"),
+                tx_hash=tx_hash,
+                quality_report=quality_report,
+                is_reminder=True
+            )
+            return
+
+        # 2. Candidate is NEW (not in Supabase) -> Run Full Inspection Pipeline
+        is_nft, nft_standard = await verify_is_nft_contract(addr)
+        if not is_nft:
+            return
+
+        if await already_owns_nft(addr):
+            mark_local_cache(addr)
+            return
+
+        is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(addr)
+        if not is_exclusive:
+            return
+
+        # Candidate Passed Entry Rules -> Run Quality Checks & Save
+        mark_local_cache(addr)
         quality_report = await run_quality_checks(http_client, addr)
-        
-        # Update last_notified_at in Supabase to current timestamp
-        update_payload = {
+
+        new_payload = {
             "address": addr,
+            "nft_standard": nft_standard,
+            "quality_score": quality_report["score_str"],
+            "function_name": func_name,
+            "tx_hash": tx_hash,
+            "minted": False,
             "last_notified_at": datetime.now(timezone.utc).isoformat()
         }
-        await upsert_supabase_record(http_client, update_payload)
+        await upsert_supabase_record(http_client, new_payload)
 
-        await send_telegram_alert(
-            http_client,
-            contract=addr,
-            nft_standard=record.get("nft_standard", "ERC-721"),
-            func_name=record.get("function_name", "mint(1)"),
-            tx_hash=tx_hash,
-            quality_report=quality_report,
-            is_reminder=True
-        )
-        return
+        await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)
 
-    # 2. Candidate is NEW (not in Supabase) -> Run Full Inspection Pipeline
-    is_nft, nft_standard = await verify_is_nft_contract(addr)
-    if not is_nft:
-        return
-
-    if await already_owns_nft(addr):
-        mark_local_cache(addr)
-        return
-
-    is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(addr)
-    if not is_exclusive:
-        return
-
-    # Candidate Passed Entry Rules -> Run Quality Checks & Save
-    mark_local_cache(addr)
-    quality_report = await run_quality_checks(http_client, addr)
-
-    new_payload = {
-        "address": addr,
-        "nft_standard": nft_standard,
-        "quality_score": quality_report["score_str"],
-        "function_name": func_name,
-        "tx_hash": tx_hash,
-        "minted": False,
-        "last_notified_at": datetime.now(timezone.utc).isoformat()
-    }
-    await upsert_supabase_record(http_client, new_payload)
-
-    await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)
-
+    finally:
+        # Always release the lock when finished processing this address
+        ACTIVE_PROCESSING.remove(addr)
 
 # ==========================================
 # WEBSOCKET EVENT LISTENER

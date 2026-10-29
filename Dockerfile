@@ -22,12 +22,12 @@ RUN add-apt-repository ppa:deadsnakes/ppa \
 # Ensure python3.12 is the default python3
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
-# Install Node.js (LTS version) for npm and npx tools
+# Install Node.js (LTS version) - npx is included automatically
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs
 
-# Install the official Binance Agentic Wallet toolkit globally
-RUN npm install -g npx && npx skills add binance/binance-skills-hub/skills/binance-web3/binance-agentic-wallet
+# Install the official Binance Agentic Wallet toolkit via npx without prompting
+RUN npx --yes skills add binance/binance-skills-hub/skills/binance-web3/binance-agentic-wallet
 
 # Set working directory inside the container
 WORKDIR /app

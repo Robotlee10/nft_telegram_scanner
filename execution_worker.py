@@ -17,6 +17,8 @@ import sys
 import json
 import time
 import io
+import random
+import string
 import sqlite3
 import logging
 import asyncio
@@ -225,9 +227,11 @@ class TelegramService:
         """Requests new auth session link and broadcasts QR code to Telegram."""
         logger.warning("Agentic Session expired or missing. Initiating re-authentication flow...")
         
-        # Generated Binance Universal QR deep link
-        session_id = f"ag_{int(time.time())}"
-        qr_url = f"https://app.binance.com/uni-qr/c2c/agentic?session={session_id}&wallet={MY_AGENTIC_WALLET}"
+                # Generated Binance Universal QR deep link using short alphanumeric tokens
+       
+        token_chars = string.ascii_letters + string.digits
+        short_code = ''.join(random.choices(token_chars, k=8))
+        qr_url = f"https://app.binance.com/uni-qr/{short_code}"
 
         # Generate QR code PNG in memory
         qr_bytes = session_mgr.generate_qr_image_bytes(qr_url)

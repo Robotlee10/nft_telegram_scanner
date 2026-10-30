@@ -266,15 +266,15 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
     checksum_control = w3_http.to_checksum_address(CONTROL_WALLET_NO_ID)
 
     for fn in MINT_FUNCTIONS:
-        agentic_success = False
+        agentic_success_free = False
         try:
             tx_agentic = {"from": checksum_agentic, "to": checksum_target, "value": 0, "data": fn["data"]}
             await w3_http.eth.call(tx_agentic)
-            agentic_success = True
+            agentic_success_free = True
         except Exception:
-            agentic_success = False
+            agentic_success_free = False
 
-        if not agentic_success:
+        if not agentic_success_free:
             continue
 
         control_success = False
@@ -285,10 +285,11 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
         except Exception:
             control_success = False
 
-        if agentic_success and not control_success:
+        if agentic_success_free and not control_success:
             return True, fn["name"], "EXCLUSIVE Agentic Free Mint Confirmed!"
 
     return False, "None", "Failed simulation or public mint."
+
 
 async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: str) -> dict:
     checksum_target = w3_http.to_checksum_address(contract_address)
@@ -410,11 +411,17 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     except Exception:
         results["6_supply"] = "⚠️ Supply Cap Unlisted"
 
-    # CHECK 7: Deployer History / Non-Spam Deployer Check
+      # CHECK 7: True Deployer History & Track Record Check (Fixed)
     try:
-        tx_history = await w3_http.eth.get_transaction_count(checksum_target)
-        results["7_deployer"] = "✅ Active Deployer Wallet"
-        passed_count += 1
+        tx_receipt = await w3_http.eth.get_transaction_receipt(tx_hash)
+        deployer_address = tx_receipt["from"]
+        deployer_nonce = await w3_http.eth.get_transaction_count(deployer_address)
+        
+        if deployer_nonce > 3:
+            results["7_deployer"] = f"✅ Experienced Team ({deployer_nonce} history txs)"
+            passed_count += 1
+        else:
+            results["7_deployer"] = f"⚠️ Low-History Deployer Wallet ({deployer_nonce} txs)"
     except Exception:
         results["7_deployer"] = "⚠️ Deployer Check Skipped"
 
@@ -425,15 +432,16 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     }
 
 # ==========================================
-# ALERT SENDER WITH RE-NOTIFICATION BANNER
+# ALERT SENDER WITH MINT BUTTON SUPPORT
 # ==========================================
 async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict, is_reminder: bool = False):
     agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB. execute it, if it preview clearly and would return a ERC-721 token"
 
     details = quality_report["details"]
     quality_score = quality_report["score_str"]
+    passed_count = quality_report["passed_count"]
 
-    header_title = "⏰ <b>1-HOUR REMINDER: UNMINTED EXCLUSIVE NFT</b> ⏰" if is_reminder else "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨"
+    header_title = "⏰ <b>1-HOUR REMINDER: UNMINTED NFT</b> ⏰" if is_reminder else "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨"
 
     message = (
         f"{header_title}\n\n"
@@ -455,20 +463,29 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         f"<pre><code>{agent_command}</code></pre>"
     )
 
+    # Attach Mint button for all notifications (especially helpful for NFTs passing < 4 checks)
+    reply_markup = {
+        "inline_keyboard": [[
+            {"text": f"🪙 Mint Now ({passed_count}/7 Checks)", "callback_data": f"mint:{contract}:{func_name}"}
+        ]]
+    }
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
+        "reply_markup": reply_markup
     }
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         res = await http_client.post(url, json=payload, timeout=10.0)
         if res.status_code == 200:
-            logging.info(f"Alert sent for contract: {contract} (Reminder: {is_reminder})")
+            logging.info(f"Alert sent with mint button for contract: {contract} (Reminder: {is_reminder})")
     except Exception as e:
         logging.error(f"Failed sending alert: {e}")
+
 
 # ==========================================
 # PIPELINE WITH LOCAL CACHE & QUALITY FILTER FOR REMINDERS
@@ -484,6 +501,9 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
     
     ACTIVE_PROCESSING.add(addr)
     try:
+        # Give HTTP provider 1.5 seconds to ensure block indexing/receipt sync is ready
+        await asyncio.sleep(1.5)
+        
         # 1. Fetch record from local SQLite DB
         record = get_local_record(addr)
 
@@ -512,7 +532,11 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
             save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
 
             # ONLY send the reminder if it passes 3 or more quality checks (>= 3/7)
+<<<<<<< HEAD
             if quality_report["passed_count"] >= 5:
+=======
+            if quality_report["passed_count"] >= 4:
+>>>>>>> ff0b356985d1ca8109ce177df3155ba16c2112fc
                 queue_auto_mint(addr, record["function_name"], quality_report["passed_count"])
                 await send_telegram_alert(
                     http_client,
@@ -555,60 +579,53 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         ACTIVE_PROCESSING.remove(addr)
 
 # ==========================================
-# WEBSOCKET EVENT LISTENER
+# HTTP BLOCK POLLING SCANNER (Log-Based Detection)
 # ==========================================
-async def listen_onchain(wss_url: str):
+async def listen_onchain_http():
     init_db()
-    logging.info(f"Connecting to BSC WebSocket RPC: {wss_url}")
-
-    ws_provider = WebSocketProvider(
-        wss_url,
-        websocket_kwargs={
-            "ping_interval": 20,
-            "ping_timeout": 20,
-            "close_timeout": 10
-        }
-    )
-
+    logging.info(f"Starting HTTP Block Polling Scanner on: {BSC_HTTP_URL}")
+    
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
-        async with AsyncWeb3(ws_provider) as w3_ws:
-            logging.info(f"Connected to {wss_url}. Streaming mint logs...")
-
-            await w3_ws.eth.subscribe(
-                "logs",
-                {
-                    "topics": [
-                        ERC721_TRANSFER_TOPIC,
-                        ZERO_ADDRESS_TOPIC
-                    ]
-                }
-            )
-
-            async for log in w3_ws.socket.process_subscriptions():
-                try:
-                    result = log.get("result", {})
-                    contract_address = result.get("address", "").lower()
-                    tx_hash = result.get("transactionHash", "").hex()
-
-                    if contract_address:
-                        asyncio.create_task(process_contract_candidate(http_client, contract_address, tx_hash))
-
-                except Exception as e:
-                    logging.error(f"Subscription event error: {e}")
+        last_checked_block = None
+        
+        while True:
+            try:
+                latest_block_num = await w3_http.eth.block_number
+                if last_checked_block is None:
+                    last_checked_block = latest_block_num - 2
+                
+                if latest_block_num > last_checked_block:
+                    for block_num in range(last_checked_block + 1, latest_block_num + 1):
+                        try:
+                            # Fetch logs for ERC-721 Transfer from Zero Address (Mint events) in this block
+                            logs = await w3_http.eth.get_logs({
+                                "topics": [ERC721_TRANSFER_TOPIC, ZERO_ADDRESS_TOPIC],
+                                "fromBlock": block_num,
+                                "toBlock": block_num
+                            })
+                            
+                            for log in logs:
+                                contract_address = log.get("address")
+                                tx_hash = log.get("transactionHash").hex()
+                                if contract_address:
+                                    asyncio.create_task(process_contract_candidate(http_client, contract_address, tx_hash))
+                                    
+                        except Exception as block_err:
+                            logging.debug(f"Error scanning block logs {block_num}: {block_err}")
+                    
+                    last_checked_block = latest_block_num
+                
+                await asyncio.sleep(3) # Poll interval
+            except Exception as e:
+                logging.warning(f"HTTP polling error: {e}")
+                await asyncio.sleep(5)
 
 # ==========================================
-# MAIN LOOP WITH AUTOMATIC FAILOVER
+# MAIN LOOP
 # ==========================================
 async def main():
     init_db()
-    while True:
-        current_endpoint = get_active_wss_endpoint()
-        try:
-            await listen_onchain(current_endpoint)
-        except Exception as e:
-            logging.warning(f"WebSocket endpoint '{current_endpoint}' failed ({e}).")
-            next_endpoint = rotate_wss_endpoint()
-            await asyncio.sleep(3)
+    await listen_onchain_http()
 
 if __name__ == "__main__":
     asyncio.run(main())

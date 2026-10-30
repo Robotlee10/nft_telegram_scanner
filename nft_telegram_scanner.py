@@ -432,15 +432,16 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     }
 
 # ==========================================
-# ALERT SENDER WITH RE-NOTIFICATION BANNER
+# ALERT SENDER WITH MINT BUTTON SUPPORT
 # ==========================================
 async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict, is_reminder: bool = False):
     agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB. execute it, if it preview clearly and would return a ERC-721 token"
 
     details = quality_report["details"]
     quality_score = quality_report["score_str"]
+    passed_count = quality_report["passed_count"]
 
-    header_title = "⏰ <b>1-HOUR REMINDER: UNMINTED EXCLUSIVE NFT</b> ⏰" if is_reminder else "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨"
+    header_title = "⏰ <b>1-HOUR REMINDER: UNMINTED NFT</b> ⏰" if is_reminder else "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨"
 
     message = (
         f"{header_title}\n\n"
@@ -462,20 +463,29 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         f"<pre><code>{agent_command}</code></pre>"
     )
 
+    # Attach Mint button for all notifications (especially helpful for NFTs passing < 4 checks)
+    reply_markup = {
+        "inline_keyboard": [[
+            {"text": f"🪙 Mint Now ({passed_count}/7 Checks)", "callback_data": f"mint:{contract}:{func_name}"}
+        ]]
+    }
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
+        "reply_markup": reply_markup
     }
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         res = await http_client.post(url, json=payload, timeout=10.0)
         if res.status_code == 200:
-            logging.info(f"Alert sent for contract: {contract} (Reminder: {is_reminder})")
+            logging.info(f"Alert sent with mint button for contract: {contract} (Reminder: {is_reminder})")
     except Exception as e:
         logging.error(f"Failed sending alert: {e}")
+
 
 # ==========================================
 # PIPELINE WITH LOCAL CACHE & QUALITY FILTER FOR REMINDERS
@@ -521,8 +531,8 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
             # Update last notified timestamp locally to reset the 1-hour timer
             save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
 
-            # ONLY send the reminder if it passes 4 or more quality checks (>= 4/7)
-            if quality_report["passed_count"] >= 4:
+            # ONLY send the reminder if it passes 3 or more quality checks (>= 3/7)
+            if quality_report["passed_count"] >= 3:
                 queue_auto_mint(addr, record["function_name"], quality_report["passed_count"])
                 await send_telegram_alert(
                     http_client,

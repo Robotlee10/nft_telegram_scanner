@@ -1,8 +1,4 @@
 import os
-import io
-import re
-import html
-import json
 import asyncio
 import logging
 import sqlite3
@@ -10,7 +6,9 @@ import httpx
 from datetime import datetime, timezone
 from pathlib import Path
 from web3 import AsyncWeb3
-from web3.providers import WebSocketProvider, AsyncHTTPProvider
+from web3.providers import AsyncHTTPProvider
+from web3.types import TxParams
+from hexbytes import HexBytes
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
@@ -45,8 +43,8 @@ MY_AGENTIC_WALLET = os.getenv("MY_AGENTIC_WALLET", "0xYourBinanceAgenticWalletAd
 CONTROL_WALLET_NO_ID = os.getenv("CONTROL_WALLET_NO_ID", "0x0000000000000000000000000000000000000001")
 
 # Standard On-Chain Topics
-ERC721_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-ZERO_ADDRESS_TOPIC = "0x0000000000000000000000000000000000000000000000000000000000000000"
+ERC721_TRANSFER_TOPIC = HexBytes("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+ZERO_ADDRESS_TOPIC = HexBytes("0x0000000000000000000000000000000000000000000000000000000000000000")
 
 MINT_FUNCTIONS = [
     {"name": "mint(1)", "data": "a0712d680000000000000000000000000000000000000000000000000000000000000001"},
@@ -80,7 +78,9 @@ METADATA_ABI = [
 ]
 
 SUPPLY_ABI = [
-    {"inputs": [], "name": "maxSupply", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}
+    {"inputs": [], "name": "maxSupply", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "MAX_SUPPLY", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "totalSupplyCap", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
 
 ERC721_INTERFACE_ID = "0x80ac58cd"
@@ -88,6 +88,7 @@ ERC1155_INTERFACE_ID = "0xd9b67a26"
 ERC2981_ROYALTY_INTERFACE_ID = "0x2a55205a"
 
 DB_FILE = Path(__file__).resolve().with_name("agentic_mints.db")
+AUTO_MINT_THRESHOLD = 4
 
 w3_http = AsyncWeb3(AsyncHTTPProvider(BSC_HTTP_URL))
 
@@ -167,6 +168,10 @@ def save_local_record(address: str, nft_standard: str, function_name: str, tx_ha
             INSERT INTO notified_contracts (address, nft_standard, function_name, tx_hash, minted, last_notified_at)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(address) DO UPDATE SET
+                nft_standard = excluded.nft_standard,
+                function_name = excluded.function_name,
+                tx_hash = excluded.tx_hash,
+                minted = excluded.minted,
                 last_notified_at = excluded.last_notified_at
         """, (address.lower(), nft_standard, function_name, tx_hash, minted, datetime.now(timezone.utc).isoformat()))
         conn.commit()
@@ -176,7 +181,7 @@ def save_local_record(address: str, nft_standard: str, function_name: str, tx_ha
         logging.error(f"SQLite write error for {address}: {e}")
 
 def queue_auto_mint(address: str, function_name: str, quality_score: int):
-    if quality_score < 3:
+    if quality_score < AUTO_MINT_THRESHOLD:
         return
 
     conn = None
@@ -268,7 +273,12 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
     for fn in MINT_FUNCTIONS:
         agentic_success_free = False
         try:
-            tx_agentic = {"from": checksum_agentic, "to": checksum_target, "value": 0, "data": fn["data"]}
+            tx_agentic: TxParams = {
+                "from": checksum_agentic,
+                "to": checksum_target,
+                "value": w3_http.to_wei(0, "wei"),
+                "data": HexBytes(fn["data"]),
+            }
             await w3_http.eth.call(tx_agentic)
             agentic_success_free = True
         except Exception:
@@ -279,7 +289,12 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
 
         control_success = False
         try:
-            tx_control = {"from": checksum_control, "to": checksum_target, "value": 0, "data": fn["data"]}
+            tx_control: TxParams = {
+                "from": checksum_control,
+                "to": checksum_target,
+                "value": w3_http.to_wei(0, "wei"),
+                "data": HexBytes(fn["data"]),
+            }
             await w3_http.eth.call(tx_control)
             control_success = True
         except Exception:
@@ -291,7 +306,9 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
     return False, "None", "Failed simulation or public mint."
 
 
-async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: str) -> dict:
+async def run_quality_checks(
+    http_client: httpx.AsyncClient, contract_address: str, tx_hash: str
+) -> dict:
     checksum_target = w3_http.to_checksum_address(contract_address)
     passed_count = 0
     results = {}
@@ -373,8 +390,7 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
         else:
             results["4_diversity"] = "❌ Bot Farm Concentration"
     except Exception:
-        results["4_diversity"] = "✅ Single Mint Event"
-        passed_count += 1
+        results["4_diversity"] = "⚠️ Diversity Check Error"
 
     # CHECK 5: ERC-2981 Royalty Standard Support
     try:
@@ -411,19 +427,21 @@ async def run_quality_checks(http_client: httpx.AsyncClient, contract_address: s
     except Exception:
         results["6_supply"] = "⚠️ Supply Cap Unlisted"
 
-      # CHECK 7: True Deployer History & Track Record Check (Fixed)
+    # CHECK 7: Minter History
     try:
-        tx_receipt = await w3_http.eth.get_transaction_receipt(tx_hash)
-        deployer_address = tx_receipt["from"]
-        deployer_nonce = await w3_http.eth.get_transaction_count(deployer_address)
+        transaction = await w3_http.eth.get_transaction(HexBytes(tx_hash))
+        minter_address = transaction.get("from")
+        if not minter_address:
+            raise ValueError("Mint transaction has no sender address.")
+        minter_nonce = await w3_http.eth.get_transaction_count(minter_address)
         
-        if deployer_nonce > 3:
-            results["7_deployer"] = f"✅ Experienced Team ({deployer_nonce} history txs)"
+        if minter_nonce > 3:
+            results["7_minter"] = f"✅ Experienced Minter ({minter_nonce} history txs)"
             passed_count += 1
         else:
-            results["7_deployer"] = f"⚠️ Low-History Deployer Wallet ({deployer_nonce} txs)"
+            results["7_minter"] = f"⚠️ Low-History Minter Wallet ({minter_nonce} txs)"
     except Exception:
-        results["7_deployer"] = "⚠️ Deployer Check Skipped"
+        results["7_minter"] = "⚠️ Minter Check Skipped"
 
     return {
         "score_str": f"{passed_count}/7 Passed",
@@ -456,7 +474,7 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         f"4️⃣ <b>Minter Diversity:</b> {details.get('4_diversity')}\n"
         f"5️⃣ <b>ERC-2981 Royalty:</b> {details.get('5_royalty')}\n"
         f"6️⃣ <b>Supply Scarcity:</b> {details.get('6_supply')}\n"
-        f"7️⃣ <b>Deployer Profile:</b> {details.get('7_deployer')}\n\n"
+        f"7️⃣ <b>Minter Profile:</b> {details.get('7_minter')}\n\n"
         f"🔗 <b>BscScan:</b> https://bscscan.com/address/{contract}\n"
         f"⚡ <b>Detected TX:</b> https://bscscan.com/tx/{tx_hash}\n\n"
         f"🤖 <b>Direct Agent Command:</b>\n"
@@ -526,17 +544,12 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
                     return
 
             # Passed 1 hour without being minted -> Run quality checks again
-            quality_report = await run_quality_checks(http_client, addr)
+            quality_report = await run_quality_checks(http_client, addr, tx_hash)
             
             # Update last notified timestamp locally to reset the 1-hour timer
             save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
 
-            # ONLY send the reminder if it passes 3 or more quality checks (>= 3/7)
-<<<<<<< HEAD
-            if quality_report["passed_count"] >= 5:
-=======
-            if quality_report["passed_count"] >= 4:
->>>>>>> ff0b356985d1ca8109ce177df3155ba16c2112fc
+            if quality_report["passed_count"] >= AUTO_MINT_THRESHOLD:
                 queue_auto_mint(addr, record["function_name"], quality_report["passed_count"])
                 await send_telegram_alert(
                     http_client,
@@ -551,9 +564,6 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
                 logging.info(f"Skipped 1-hour reminder for {addr}: Quality score dropped ({quality_report['score_str']})")
             return
 
-        # 2. Candidate is NEW -> Save placeholder immediately to prevent concurrent duplicates
-        save_local_record(addr, "ERC-721", "mint(1)", tx_hash, minted=False)
-
         # Run Full Inspection Pipeline
         is_nft, nft_standard = await verify_is_nft_contract(addr)
         if not is_nft:
@@ -562,12 +572,12 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         if await already_owns_nft(addr):
             return
 
-        is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(addr)
+        is_exclusive, func_name, _ = await simulate_exclusive_agentic_mint(addr)
         if not is_exclusive:
             return
 
         # Candidate Passed Entry Rules -> Run Quality Checks & Save
-        quality_report = await run_quality_checks(http_client, addr)
+        quality_report = await run_quality_checks(http_client, addr, tx_hash)
 
         save_local_record(addr, nft_standard, func_name, tx_hash, minted=False)
         queue_auto_mint(addr, func_name, quality_report["passed_count"])

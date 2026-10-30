@@ -1,13 +1,16 @@
 import os
 import asyncio
+import json
 import logging
 import sqlite3
 import httpx
+import websockets
 from datetime import datetime, timezone
 from pathlib import Path
+from eth_typing import ChecksumAddress
 from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
-from web3.types import TxParams
+from web3.types import BlockIdentifier, FilterParams, TxParams
 from hexbytes import HexBytes
 from dotenv import load_dotenv
 
@@ -25,16 +28,8 @@ for logger_name in ["httpx", "httpcore", "urllib3", "requests"]:
 # ==========================================
 # CONFIGURATION & HIGH-SPEED RPC POOLS
 # ==========================================
-BSC_WSS_POOL = [
-    os.getenv("BSC_WSS_URL", "wss://bsc-mainnet.nodereal.io/ws/v1/6a254628001a4daab023c41cea7e686c"),
-    "wss://bnb-mainnet.g.alchemy.com/v2/alch_VKpuhQjbfjUDGyyc0Ntwc",
-    "wss://tiniest-necessary-mountain.bsc.quiknode.pro/8d4b8e3bbbe17df68ca7a1bd32f48b67324a538a/",
-    "wss://bsc-mainnet.core.chainstack.com/301d34f2b36b95a1a7d0632c072cbb0b",
-    "wss://rpc-bsc.blockmachine.io",
-    "wss://bnb-chain.wss.run"
-]
-
-BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-dataseed1.binance.org/")
+BSC_WSS_URL = os.getenv("BSC_WSS_URL", "wss://rpc-bsc.blockmachine.io")
+BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-rpc.publicnode.com")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
@@ -45,6 +40,8 @@ CONTROL_WALLET_NO_ID = os.getenv("CONTROL_WALLET_NO_ID", "0x00000000000000000000
 # Standard On-Chain Topics
 ERC721_TRANSFER_TOPIC = HexBytes("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 ZERO_ADDRESS_TOPIC = HexBytes("0x0000000000000000000000000000000000000000000000000000000000000000")
+ERC1155_TRANSFER_SINGLE_TOPIC = HexBytes("0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62")
+ERC1155_TRANSFER_BATCH_TOPIC = HexBytes("0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb")
 
 MINT_FUNCTIONS = [
     {"name": "mint(1)", "data": "a0712d680000000000000000000000000000000000000000000000000000000000000001"},
@@ -92,17 +89,39 @@ AUTO_MINT_THRESHOLD = 4
 
 w3_http = AsyncWeb3(AsyncHTTPProvider(BSC_HTTP_URL))
 
-current_wss_index = 0
+async def get_mint_logs(
+    address: ChecksumAddress,
+    from_block: BlockIdentifier | None = None,
+    to_block: BlockIdentifier | None = None,
+) -> list:
+    event_topics = (
+        [ERC721_TRANSFER_TOPIC, ZERO_ADDRESS_TOPIC],
+        [ERC1155_TRANSFER_SINGLE_TOPIC, None, ZERO_ADDRESS_TOPIC],
+        [ERC1155_TRANSFER_BATCH_TOPIC, None, ZERO_ADDRESS_TOPIC],
+    )
+    logs = []
+    for topics in event_topics:
+        filter_params: FilterParams = {"topics": topics}
+        filter_params["address"] = address
+        if from_block is not None:
+            filter_params["fromBlock"] = from_block
+        if to_block is not None:
+            filter_params["toBlock"] = to_block
+        logs.extend(await w3_http.eth.get_logs(filter_params))
+    return logs
 
-def get_active_wss_endpoint() -> str:
-    return BSC_WSS_POOL[current_wss_index % len(BSC_WSS_POOL)]
 
-def rotate_wss_endpoint() -> str:
-    global current_wss_index
-    current_wss_index += 1
-    next_endpoint = get_active_wss_endpoint()
-    logging.info(f"Switched active WebSocket RPC to: {next_endpoint}")
-    return next_endpoint
+def get_mint_recipient(log) -> str | None:
+    event_topic = log["topics"][0].hex().lower()
+    recipient_index = 2 if event_topic == ERC721_TRANSFER_TOPIC.hex().lower() else 3
+    if len(log["topics"]) <= recipient_index:
+        return None
+    return "0x" + log["topics"][recipient_index].hex().removeprefix("0x").lower()
+
+
+def topic_to_rpc_hex(topic: HexBytes) -> str:
+    return "0x" + topic.hex().removeprefix("0x")
+
 
 # ==========================================
 # LOCAL SQLITE DATABASE ENGINE (SOLE STORAGE)
@@ -317,14 +336,12 @@ async def run_quality_checks(
     try:
         latest_block = await w3_http.eth.block_number
         from_block = max(0, latest_block - 1000)
-        logs = await w3_http.eth.get_logs({
-            "address": checksum_target,
-            "topics": [ERC721_TRANSFER_TOPIC, ZERO_ADDRESS_TOPIC],
-            "fromBlock": from_block
-        })
+        logs = await get_mint_logs(checksum_target, from_block)
         
-        # Extract unique minter addresses (topic[2] is the recipient of the ERC-721 transfer)
-        unique_minters = set(log["topics"][2].hex() for log in logs if len(log["topics"]) > 2)
+        unique_minters = {
+            recipient for log in logs
+            if (recipient := get_mint_recipient(log)) is not None
+        }
         total_mints = len(logs)
         
         # STRICTER RULE: Must have at least 5 total mints AND at least 3 unique minter wallets
@@ -378,12 +395,11 @@ async def run_quality_checks(
 
     # CHECK 4: Unique Minter Velocity (Anti-Bot Farm Check)
     try:
-        logs = await w3_http.eth.get_logs({
-            "address": checksum_target,
-            "topics": [ERC721_TRANSFER_TOPIC, ZERO_ADDRESS_TOPIC],
-            "fromBlock": "latest"
-        })
-        unique_minters = set(log["topics"][2].hex() for log in logs if len(log["topics"]) > 2)
+        logs = await get_mint_logs(checksum_target, "latest")
+        unique_minters = {
+            recipient for log in logs
+            if (recipient := get_mint_recipient(log)) is not None
+        }
         if len(unique_minters) >= 2 or len(logs) < 3:
             results["4_diversity"] = f"✅ Organic Demand ({len(unique_minters)} minters)"
             passed_count += 1
@@ -499,8 +515,23 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         res = await http_client.post(url, json=payload, timeout=10.0)
-        if res.status_code == 200:
+        try:
+            response_data = res.json()
+        except ValueError:
+            logging.error(
+                "Telegram sendMessage returned HTTP %s with a non-JSON response: %s",
+                res.status_code,
+                res.text[:300],
+            )
+            return
+        if res.is_success and response_data.get("ok") is True:
             logging.info(f"Alert sent with mint button for contract: {contract} (Reminder: {is_reminder})")
+        else:
+            logging.error(
+                "Telegram sendMessage failed (HTTP %s): %s",
+                res.status_code,
+                response_data.get("description", "Telegram returned ok=false"),
+            )
     except Exception as e:
         logging.error(f"Failed sending alert: {e}")
 
@@ -538,6 +569,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 
                     # Ignore candidate if notified less than 1 hour ago
                     if elapsed_seconds < 3600:
+                        logging.info("Skipped %s: reminder cooldown has not expired.", addr)
                         return
                 except Exception as e:
                     logging.debug(f"Timestamp parse error: {e}")
@@ -567,13 +599,15 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         # Run Full Inspection Pipeline
         is_nft, nft_standard = await verify_is_nft_contract(addr)
         if not is_nft:
+            logging.info("Ignored mint event from non-NFT contract %s.", addr)
             return
 
         if await already_owns_nft(addr):
             return
 
-        is_exclusive, func_name, _ = await simulate_exclusive_agentic_mint(addr)
+        is_exclusive, func_name, reason = await simulate_exclusive_agentic_mint(addr)
         if not is_exclusive:
+            logging.info("Ignored NFT %s: %s", addr, reason)
             return
 
         # Candidate Passed Entry Rules -> Run Quality Checks & Save
@@ -584,50 +618,109 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         
         # Notify for ALL valid initial NFT detections with score included
         await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)
+        logging.info("Detected eligible %s NFT %s; Telegram alert attempted.", nft_standard, addr)
 
+    except Exception:
+        logging.exception("Failed processing mint candidate %s (tx %s).", addr, tx_hash)
     finally:
         ACTIVE_PROCESSING.remove(addr)
 
+
+async def process_contract_candidate_logged(
+    http_client: httpx.AsyncClient, contract_address: str, tx_hash: str
+) -> None:
+    try:
+        await process_contract_candidate(http_client, contract_address, tx_hash)
+    except Exception:
+        logging.exception("Unhandled candidate processing error for %s (tx %s).", contract_address, tx_hash)
+
+
+def queue_candidate_from_notification(http_client: httpx.AsyncClient, message: dict) -> None:
+    if message.get("method") != "eth_subscription":
+        return
+    log = message.get("params", {}).get("result", {})
+    contract_address = log.get("address")
+    transaction_hash = log.get("transactionHash")
+    if not contract_address or not transaction_hash:
+        return
+    logging.info(
+        "Received NFT mint event for %s in block %s.",
+        contract_address,
+        log.get("blockNumber", "unknown"),
+    )
+    asyncio.create_task(
+        process_contract_candidate_logged(
+            http_client,
+            contract_address,
+            transaction_hash,
+        )
+    )
+
+
 # ==========================================
-# HTTP BLOCK POLLING SCANNER (Log-Based Detection)
+# WEBSOCKET MINT EVENT SCANNER
 # ==========================================
-async def listen_onchain_http():
+async def listen_onchain_websocket():
     init_db()
-    logging.info(f"Starting HTTP Block Polling Scanner on: {BSC_HTTP_URL}")
-    
+    logging.info("Starting BSC mint event scanner.")
+    event_filters = (
+        [topic_to_rpc_hex(ERC721_TRANSFER_TOPIC), topic_to_rpc_hex(ZERO_ADDRESS_TOPIC)],
+        [
+            topic_to_rpc_hex(ERC1155_TRANSFER_SINGLE_TOPIC),
+            None,
+            topic_to_rpc_hex(ZERO_ADDRESS_TOPIC),
+        ],
+        [
+            topic_to_rpc_hex(ERC1155_TRANSFER_BATCH_TOPIC),
+            None,
+            topic_to_rpc_hex(ZERO_ADDRESS_TOPIC),
+        ],
+    )
+
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
-        last_checked_block = None
-        
         while True:
             try:
-                latest_block_num = await w3_http.eth.block_number
-                if last_checked_block is None:
-                    last_checked_block = latest_block_num - 2
-                
-                if latest_block_num > last_checked_block:
-                    for block_num in range(last_checked_block + 1, latest_block_num + 1):
-                        try:
-                            # Fetch logs for ERC-721 Transfer from Zero Address (Mint events) in this block
-                            logs = await w3_http.eth.get_logs({
-                                "topics": [ERC721_TRANSFER_TOPIC, ZERO_ADDRESS_TOPIC],
-                                "fromBlock": block_num,
-                                "toBlock": block_num
-                            })
-                            
-                            for log in logs:
-                                contract_address = log.get("address")
-                                tx_hash = log.get("transactionHash").hex()
-                                if contract_address:
-                                    asyncio.create_task(process_contract_candidate(http_client, contract_address, tx_hash))
-                                    
-                        except Exception as block_err:
-                            logging.debug(f"Error scanning block logs {block_num}: {block_err}")
-                    
-                    last_checked_block = latest_block_num
-                
-                await asyncio.sleep(3) # Poll interval
+                async with websockets.connect(
+                    BSC_WSS_URL,
+                    open_timeout=15,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ) as websocket:
+                    subscriptions = set()
+                    for request_id, topics in enumerate(event_filters, start=1):
+                        await websocket.send(json.dumps({
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "method": "eth_subscribe",
+                            "params": ["logs", {"topics": topics}],
+                        }))
+                        while True:
+                            response = json.loads(
+                                await asyncio.wait_for(websocket.recv(), timeout=15)
+                            )
+                            if response.get("method") == "eth_subscription":
+                                queue_candidate_from_notification(http_client, response)
+                                continue
+                            break
+                        if response.get("id") != request_id:
+                            raise RuntimeError("Unexpected response while subscribing to BSC mint logs.")
+                        if "error" in response:
+                            error = response["error"]
+                            raise RuntimeError(
+                                f"BSC log subscription failed: {error.get('message', error)}"
+                            )
+                        subscriptions.add(response["result"])
+
+                    logging.info("BSC mint event subscriptions are active.")
+                    async for raw_message in websocket:
+                        message = json.loads(raw_message)
+                        if (
+                            message.get("method") == "eth_subscription"
+                            and message.get("params", {}).get("subscription") in subscriptions
+                        ):
+                            queue_candidate_from_notification(http_client, message)
             except Exception as e:
-                logging.warning(f"HTTP polling error: {e}")
+                logging.warning("BSC WebSocket scanner disconnected; reconnecting: %s", e)
                 await asyncio.sleep(5)
 
 # ==========================================
@@ -635,7 +728,7 @@ async def listen_onchain_http():
 # ==========================================
 async def main():
     init_db()
-    await listen_onchain_http()
+    await listen_onchain_websocket()
 
 if __name__ == "__main__":
     asyncio.run(main())

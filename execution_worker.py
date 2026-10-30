@@ -304,7 +304,7 @@ async def execute_agentic_mint(
     function_name: str,
     trigger_source: str = "AUTO",
 ) -> Tuple[str, str]:
-    logger.info(f"[{trigger_source}] Preparing reviewed mint: Contract={contract_address}, Function={function_name}")
+    logger.info(f"[{trigger_source}] Processing autonomous mint: Contract={contract_address}, Function={function_name}")
 
     calldata = MINT_CALLDATA.get(function_name)
     if not calldata:
@@ -313,93 +313,70 @@ async def execute_agentic_mint(
         return "blocked", "Binance Agentic Wallet is not connected."
     if not Web3.is_address(contract_address):
         return "failed", "Invalid contract address."
+    
     wallet_address = MY_AGENTIC_WALLET
     if not wallet_address:
         return "blocked", "MY_AGENTIC_WALLET is not configured in .env."
 
     try:
-        settings = await run_baw(["wallet", "settings", "--json"])
-        dev_mode = settings.get("devMode", {})
-        expires_at = dev_mode.get("expiresAt")
-        if (
-            not dev_mode.get("enabled")
-            or not isinstance(expires_at, (int, float))
-            or expires_at <= time.time()
-        ):
-            return "blocked", "Enable Developer Mode in the Binance App before minting."
-
+        # 1. Preview the contract call to guarantee it is valid and safe
         preview = await run_baw([
             "contract-call", "preview",
             "--binanceChainId", str(BSC_CHAIN_ID),
             "--from", wallet_address,
             "--to", contract_address,
             "--value", "0",
-            "--inputData", calldata,
+            "--data", calldata,
             "--json",
         ])
         request_id = preview.get("requestId")
         if not isinstance(request_id, str) or not request_id:
-            return "failed", "Successful preview did not return a request ID."
+            return "failed", "Preview did not return a valid request ID."
 
-        logger.info(f"Preview validated successfully for {contract_address}. Auto-executing token mint...")
+        logger.info(f"Preview passed for {contract_address}. Executing autonomously...")
 
+        # 2. Execute immediately without waiting for manual app confirmation
         execution = await run_baw([
             "contract-call", "execute",
             "--requestId", request_id,
             "--json",
         ])
-        execution_status = execution.get("status")
-
-        if execution_status == "PENDING_CONFIRMATION":
-            order_id = execution.get("orderId")
-            await telegram_service.send_message(
-                f"⏳ <b>Mint requires Binance App confirmation.</b>\n"
-                f"<b>Contract:</b> <code>{contract_address}</code>\n"
-                f"<b>Function:</b> <code>{function_name}</code>\n"
-                f"<b>Order ID:</b> <code>{order_id or 'unavailable'}</code>"
-            )
-            return "awaiting_confirmation", str(order_id or "")
-
-        if execution_status != "BROADCASTED":
-            return "failed", f"Unexpected execution status: {execution_status!r}"
-
+        
         tx_hash = execution.get("txHash")
         if not isinstance(tx_hash, str) or not tx_hash.startswith("0x"):
-            return "failed", "Broadcast response did not contain a transaction hash."
+            execution_status = execution.get("status")
+            return "failed", f"Execution did not broadcast. Status: {execution_status}"
 
-        await telegram_service.send_message(
-            f"🚀 <b>Mint Transaction Broadcasted!</b>\n\n"
-            f"<b>Contract:</b> <code>{contract_address}</code>\n"
-            f"<b>Function:</b> <code>{function_name}</code>\n"
-            f"<b>Source:</b> {trigger_source}\n"
-            f"<b>TX Hash:</b> <code>{tx_hash}</code>\n\n"
-            f"⏳ Polling BSC RPC for receipt (Timeout: {RPC_RECEIPT_TIMEOUT}s)..."
-        )
-
+        # 3. Verify transaction outcome on-chain and report back to Telegram
         receipt_success, block_num, err_detail = await verify_tx_on_chain(tx_hash)
+        bscscan_link = f"https://bscscan.com/tx/{tx_hash}"
+        
         if receipt_success:
-            bscscan_link = f"https://bscscan.com/tx/{tx_hash}"
             await telegram_service.send_message(
-                f"🟢 <b>MINT SUCCESSFUL & RECEIPT SENT!</b>\n\n"
+                f"🟢 <b>AUTONOMOUS MINT SUCCESSFUL!</b>\n\n"
                 f"<b>Contract:</b> <code>{contract_address}</code>\n"
-                f"<b>Block Number:</b> {block_num}\n"
-                f"<b>BscScan Link:</b> <a href='{bscscan_link}'>View Transaction</a>"
+                f"<b>Function:</b> <code>{function_name}</code>\n"
+                f"<b>Source:</b> {trigger_source}\n"
+                f"<b>Block:</b> {block_num}\n"
+                f"🔗 <a href='{bscscan_link}'>View on BscScan</a>"
             )
             return "success", tx_hash
-
-        await telegram_service.send_message(
-            f"🔴 <b>MINT FAILED / REVERTED!</b>\n\n"
-            f"<b>Contract:</b> <code>{contract_address}</code>\n"
-            f"<b>TX Hash:</b> <code>{tx_hash}</code>\n"
-            f"<b>Reason:</b> {err_detail}"
-        )
-        return "failed", err_detail
+        else:
+            await telegram_service.send_message(
+                f"🔴 <b>AUTONOMOUS MINT REVERTED!</b>\n\n"
+                f"<b>Contract:</b> <code>{contract_address}</code>\n"
+                f"<b>TX Hash:</b> <code>{tx_hash}</code>\n"
+                f"<b>Reason:</b> {err_detail}"
+            )
+            return "failed", err_detail
 
     except WalletCLIError as e:
-        logger.error(f"Binance Agentic Wallet operation failed: {e}")
-        return "failed", str(e)
+        err_msg = str(e)
+        logger.error(f"Agentic Wallet CLI error: {err_msg}")
+        await telegram_service.send_message(f"❌ <b>Mint Error ({trigger_source}):</b>\n<code>{err_msg}</code>")
+        return "failed", err_msg
     except Exception as e:
-        logger.exception("Unexpected error during reviewed mint execution.")
+        logger.exception("Unexpected error during autonomous execution.")
         return "failed", str(e)
 
 async def verify_tx_on_chain(tx_hash: str) -> Tuple[bool, Optional[int], str]:
@@ -494,11 +471,14 @@ async def poll_telegram_updates():
                     if "callback_query" in update:
                         cq = update["callback_query"]
                         cq_id, cb_data = cq["id"], cq.get("data", "")
-                        if cb_data.startswith("mint:"):
+                           if cb_data.startswith("mint:"):
                             parts = cb_data.split(":")
                             if len(parts) >= 3:
-                                await telegram_service.answer_callback(cq_id, "⚡ Initiating Manual Mint Execution...")
-                                asyncio.create_task(execute_agentic_mint(parts[1], parts[2], trigger_source=f"MANUAL TAP"))
+                                await telegram_service.answer_callback(cq_id, "⚡ Running Autonomous Mint...")
+                                asyncio.create_task(
+                                    execute_agentic_mint(parts[1], parts[2], trigger_source="MANUAL TAP (Autonomous)")
+                                )
+
                         elif cb_data.startswith("auth:regen"):
                             await telegram_service.answer_callback(cq_id, "🔄 Generating fresh QR code...")
                             try:

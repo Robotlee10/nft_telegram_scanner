@@ -235,9 +235,10 @@ async def run_baw(arguments: list[str], timeout: float = 30.0) -> dict:
             break
 
     if response is None:
+        # Capture the actual stderr text if available to debug exit code 1 instantly
+        err_output = result.stderr.strip() or result.stdout.strip() or "Unknown CLI crash"
         raise WalletCLIError(
-            "Binance Agentic Wallet CLI returned no valid JSON "
-            f"(exit code {result.returncode}). Check Node.js and the installed CLI."
+            f"CLI Error (Exit Code {result.returncode}): {err_output[:200]}"
         )
 
     if result.returncode != 0 or not response.get("success"):

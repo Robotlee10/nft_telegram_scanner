@@ -200,17 +200,8 @@ def save_local_record(address: str, nft_standard: str, function_name: str, tx_ha
         logging.error(f"SQLite write error for {address}: {e}")
 
 
-def queue_auto_mint(address: str, function_name: str, quality_score: int, details: dict):
-    supply_is_scarce = "✅" in details.get("6_supply", "")
-    source_is_verified = "✅" in details.get("3_source", "")
-    
-    # Define what makes an NFT eligible for auto-minting
-    is_above_threshold = quality_score >= AUTO_MINT_THRESHOLD  # Original rule (>= 4 checks)
-    is_scarce_and_decent = quality_score >= 3 and supply_is_scarce  # 3+ checks + supply scarcity
-    is_scarce_and_verified = source_is_verified and supply_is_scarce  # Verified source + supply scarcity
-    
-    # EARLY EXIT: If NONE of the valid rules match, exit immediately.
-    if not (is_above_threshold or is_scarce_and_decent or is_scarce_and_verified):
+def queue_auto_mint(address: str, function_name: str, quality_score: int):
+    if quality_score < AUTO_MINT_THRESHOLD:
         return
 
     conn = None

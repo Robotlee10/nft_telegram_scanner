@@ -1,6 +1,9 @@
 {
+  "name": "nft-telegram-scanner",
+  "version": "1.0.0",
   "private": true,
   "dependencies": {
     "@binance/agentic-wallet": "1.12.0"
   }
 }
+

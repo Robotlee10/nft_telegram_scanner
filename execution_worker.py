@@ -347,7 +347,7 @@ async def execute_agentic_mint(
             "--from", wallet_address,
             "--to", contract_address,
             "--value", "0",
-            "--data", calldata,
+            "--inputData", calldata,
             "--json",
         ])
         request_id = preview.get("requestId")

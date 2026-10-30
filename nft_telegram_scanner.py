@@ -575,60 +575,54 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         ACTIVE_PROCESSING.remove(addr)
 
 # ==========================================
-# WEBSOCKET EVENT LISTENER
+# HTTP BLOCK POLLING SCANNER (Bypasses WSS 429 Limits)
 # ==========================================
-async def listen_onchain(wss_url: str):
+async def listen_onchain_http():
     init_db()
-    logging.info(f"Connecting to BSC WebSocket RPC: {wss_url}")
-
-    ws_provider = WebSocketProvider(
-        wss_url,
-        websocket_kwargs={
-            "ping_interval": 20,
-            "ping_timeout": 20,
-            "close_timeout": 10
-        }
-    )
-
+    logging.info(f"Starting HTTP Block Polling Scanner on: {BSC_HTTP_URL}")
+    
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
-        async with AsyncWeb3(ws_provider) as w3_ws:
-            logging.info(f"Connected to {wss_url}. Streaming mint logs...")
-
-            await w3_ws.eth.subscribe(
-                "logs",
-                {
-                    "topics": [
-                        ERC721_TRANSFER_TOPIC,
-                        ZERO_ADDRESS_TOPIC
-                    ]
-                }
-            )
-
-            async for log in w3_ws.socket.process_subscriptions():
-                try:
-                    result = log.get("result", {})
-                    contract_address = result.get("address", "").lower()
-                    tx_hash = result.get("transactionHash", "").hex()
-
-                    if contract_address:
-                        asyncio.create_task(process_contract_candidate(http_client, contract_address, tx_hash))
-
-                except Exception as e:
-                    logging.error(f"Subscription event error: {e}")
+        last_checked_block = None
+        
+        while True:
+            try:
+                latest_block_num = await w3_http.eth.block_number
+                if last_checked_block is None:
+                    last_checked_block = latest_block_num - 1
+                
+                if latest_block_num > last_checked_block:
+                    for block_num in range(last_checked_block + 1, latest_block_num + 1):
+                        try:
+                            block = await w3_http.eth.get_block(block_num, full_transactions=True)
+                            if block and "transactions" in block:
+                                for tx in block["transactions"]:
+                                    # Check if transaction creates a contract or interacts with token creation
+                                    tx_hash = tx["hash"].hex()
+                                    to_addr = tx.get("to")
+                                    
+                                    # If contract creation (to is None) or logs match transfer from zero address
+                                    if to_addr is None:
+                                        # Get receipt to find deployed contract address
+                                        receipt = await w3_http.eth.get_transaction_receipt(tx_hash)
+                                        contract_address = receipt.get("contractAddress")
+                                        if contract_address:
+                                            asyncio.create_task(process_contract_candidate(http_client, contract_address, tx_hash))
+                        except Exception as block_err:
+                            logging.debug(f"Error scanning block {block_num}: {block_err}")
+                    
+                    last_checked_block = latest_block_num
+                
+                await asyncio.sleep(3) # Poll interval between blocks
+            except Exception as e:
+                logging.warning(f"HTTP polling error: {e}")
+                await asyncio.sleep(5)
 
 # ==========================================
-# MAIN LOOP WITH AUTOMATIC FAILOVER
+# MAIN LOOP
 # ==========================================
 async def main():
     init_db()
-    while True:
-        current_endpoint = get_active_wss_endpoint()
-        try:
-            await listen_onchain(current_endpoint)
-        except Exception as e:
-            logging.warning(f"WebSocket endpoint '{current_endpoint}' failed ({e}).")
-            next_endpoint = rotate_wss_endpoint()
-            await asyncio.sleep(3)
+    await listen_onchain_http()
 
 if __name__ == "__main__":
     asyncio.run(main())

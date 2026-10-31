@@ -1,12 +1,14 @@
 import asyncio
 import logging
+import os
 import sqlite3
 import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from eth_abi.abi import decode
+import httpx
+from eth_abi.abi import decode, encode
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
 from web3 import Web3
@@ -27,7 +29,13 @@ ERC20_TRANSFER = HexBytes(
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 SUMMARY_INTERVAL = 24 * 60 * 60
 INITIAL_BLOCK_RANGE = 100_000
+HISTORY_API_URL = "https://api.etherscan.io/v2/api"
+HISTORY_API_PAGE_SIZE = 1000
 logger = logging.getLogger(__name__)
+
+
+class LogQueryLimitError(RuntimeError):
+    pass
 
 
 class NftChainMonitor:
@@ -402,9 +410,19 @@ class NftChainMonitor:
             completed_initial_scan = self._get_state("initial_scan_complete") == "1"
 
             while last_scanned_block < latest_block:
-                logs, scanned_to = await self._scan_range(
-                    last_scanned_block + 1, latest_block
-                )
+                try:
+                    logs, scanned_to = await self._scan_range(
+                        last_scanned_block + 1, latest_block
+                    )
+                except LogQueryLimitError:
+                    logger.warning(
+                        "RPC log-result limit persists for a single block; "
+                        "falling back to the BNB Chain NFT transfer history API."
+                    )
+                    logs = await self._query_history_api(
+                        last_scanned_block + 1, latest_block
+                    )
+                    scanned_to = latest_block
                 self._apply_logs(logs, scanned_to)
                 last_scanned_block = scanned_to
                 if completed_initial_scan:
@@ -425,6 +443,158 @@ class NftChainMonitor:
                     self._get_state("initial_scan_complete") == "1"
                 ),
             }
+
+    async def _query_history_api(self, start_block: int, end_block: int) -> list:
+        api_key = os.getenv("BSC_HISTORY_API_KEY") or os.getenv("ETHERSCAN_API_KEY")
+        if not api_key or api_key in {
+            "YOUR_API_KEY",
+            "replace-with-your-etherscan-api-key",
+        }:
+            raise RuntimeError(
+                "The RPC provider rejected even a single-block log query and no "
+                "history API key is configured. Set BSC_HISTORY_API_KEY or "
+                "ETHERSCAN_API_KEY, or configure a BNB Chain RPC provider that "
+                "supports eth_getLogs."
+            )
+
+        logs = []
+        seen: set[tuple[str, int, str]] = set()
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for action, standard in (
+                ("tokennfttx", "ERC-721"),
+                ("token1155tx", "ERC-1155"),
+            ):
+                page = 1
+                while True:
+                    try:
+                        response = await client.get(
+                            HISTORY_API_URL,
+                            params={
+                                "chainid": "56",
+                                "module": "account",
+                                "action": action,
+                                "address": self.wallet_address,
+                                "startblock": start_block,
+                                "endblock": end_block,
+                                "page": page,
+                                "offset": HISTORY_API_PAGE_SIZE,
+                                "sort": "asc",
+                                "apikey": api_key,
+                            },
+                        )
+                    except httpx.HTTPError as error:
+                        raise RuntimeError(
+                            "BNB Chain history API request failed "
+                            f"({type(error).__name__})."
+                        ) from None
+
+                    if not response.is_success:
+                        raise RuntimeError(
+                            "BNB Chain history API returned HTTP "
+                            f"{response.status_code}."
+                        )
+                    try:
+                        payload = response.json()
+                    except ValueError as error:
+                        raise RuntimeError(
+                            "BNB Chain history API returned invalid JSON."
+                        ) from error
+
+                    if not isinstance(payload, dict):
+                        raise RuntimeError(
+                            "BNB Chain history API returned an unexpected response."
+                        )
+                    result = payload.get("result")
+                    response_message = (
+                        f"{payload.get('message', '')} {result or ''}".lower()
+                    )
+                    if (
+                        payload.get("status") == "0"
+                        and "no transactions found" in response_message
+                    ):
+                        break
+                    if payload.get("status") != "1" or not isinstance(result, list):
+                        message = (
+                            result
+                            if isinstance(result, str)
+                            else payload.get("message", "Unknown API error")
+                        )
+                        raise RuntimeError(
+                            f"BNB Chain history API error for {action}: {message}"
+                        )
+
+                    for transfer in result:
+                        normalized_log = self._history_transfer_to_log(
+                            transfer, standard, seen
+                        )
+                        if normalized_log is not None:
+                            logs.append(normalized_log)
+                    if len(result) < HISTORY_API_PAGE_SIZE:
+                        break
+                    page += 1
+
+        logs.sort(
+            key=lambda log: (int(log["blockNumber"]), int(log["logIndex"]))
+        )
+        return logs
+
+    def _history_transfer_to_log(
+        self,
+        transfer: dict,
+        standard: str,
+        seen: set[tuple[str, int, str]],
+    ) -> dict | None:
+        try:
+            contract = self.web3.to_checksum_address(transfer["contractAddress"])
+            sender = self.web3.to_checksum_address(transfer["from"])
+            recipient = self.web3.to_checksum_address(transfer["to"])
+            token_id = int(transfer["tokenID"])
+            quantity = int(transfer.get("tokenValue", "1"))
+            block_number = int(transfer["blockNumber"])
+            log_index = int(transfer["logIndex"])
+            transaction_hash = HexBytes(transfer["hash"])
+        except Exception as error:
+            raise RuntimeError(
+                "BNB Chain history API returned a malformed NFT transfer record."
+            ) from error
+
+        if token_id < 0 or quantity <= 0 or block_number < 0 or log_index < 0:
+            raise RuntimeError(
+                "BNB Chain history API returned invalid NFT transfer values."
+            )
+
+        identity = (transaction_hash.hex(), log_index, str(token_id))
+        if identity in seen:
+            return None
+        seen.add(identity)
+
+        sender_topic = HexBytes("0x" + sender[2:].lower().zfill(64))
+        recipient_topic = HexBytes("0x" + recipient[2:].lower().zfill(64))
+        if standard == "ERC-721":
+            topics = [
+                ERC721_TRANSFER,
+                sender_topic,
+                recipient_topic,
+                HexBytes("0x" + format(token_id, "064x")),
+            ]
+            data = HexBytes("0x")
+        else:
+            topics = [
+                ERC1155_TRANSFER_SINGLE,
+                HexBytes("0x" + "0" * 64),
+                sender_topic,
+                recipient_topic,
+            ]
+            data = HexBytes(encode(["uint256", "uint256"], [token_id, quantity]))
+
+        return {
+            "address": contract,
+            "topics": topics,
+            "data": data,
+            "blockNumber": block_number,
+            "logIndex": log_index,
+            "transactionHash": transaction_hash,
+        }
 
     async def send_scan_report(self, scan: dict[str, int]) -> None:
         holdings = self._get_holdings()
@@ -486,11 +656,10 @@ class NftChainMonitor:
                 if not self._is_log_limit_error(error):
                     raise
                 if range_size <= 1:
-                    raise RuntimeError(
+                    raise LogQueryLimitError(
                         "The BNB RPC provider rejected NFT log queries for a single "
                         f"block ({start}) even after splitting filters by NFT event and "
-                        "wallet direction. Use a provider with a higher eth_getLogs "
-                        "response limit or retry this scan later."
+                        "wallet direction."
                     ) from error
                 range_size = max(1, range_size // 2)
                 logger.warning(

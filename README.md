@@ -80,6 +80,10 @@ BSC_WSS_URL=wss://your-bnb-websocket-rpc
 # Optional: used to check source-code verification in the quality score.
 ETHERSCAN_API_KEY=your-etherscan-api-key
 
+# Optional: used as a fallback for wallet NFT history if eth_getLogs is capped.
+# If omitted, ETHERSCAN_API_KEY is used for this fallback.
+BSC_HISTORY_API_KEY=your-etherscan-api-key
+
 # Optional: used as the comparison wallet for the exclusive mint access test.
 CONTROL_WALLET_NO_ID=0x0000000000000000000000000000000000000001
 ```
@@ -125,15 +129,22 @@ contract's NFT standard, access gate, mint function, and quality score.
 
 ## RPC log limits
 
-Some BNB Chain RPC providers cap the number of blocks or logs returned by
-`eth_getLogs`. The holdings monitor responds to recognized range/result-limit
-errors by shrinking the block range and retrying. It also queries each NFT event
-and wallet direction separately to keep each result set smaller.
+Some BNB Chain RPC providers cap or disable historical `eth_getLogs` queries.
+The monitor responds to recognized range/result-limit errors by shrinking block
+ranges and splitting queries by NFT event and wallet direction. If even one
+block is rejected, it falls back to the [Etherscan API V2 ERC-721](https://docs.etherscan.io/api-reference/endpoint/tokennfttx)
+and [ERC-1155](https://docs.etherscan.io/api-reference/endpoint/token1155tx)
+transfer-history endpoints, paginating the wallet's transfers for the remaining
+block range. Set `BSC_HISTORY_API_KEY`, or reuse `ETHERSCAN_API_KEY`, to enable
+this fallback. The wallet address and requested block range are sent to
+Etherscan when this fallback is used.
 
-If a provider still rejects a query covering a single block, the scan fails
-without advancing its saved checkpoint. Configure `BSC_HTTP_URL` to a BNB Chain
-RPC provider with a higher historical log-query limit, then run `/scannft` again.
-The scanner logs the provider error and the block range it was attempting.
+If neither the RPC nor the history API can complete the query, `/scannft`
+reports the error and the scan checkpoint is not advanced for the failed range.
+You can also configure `BSC_HTTP_URL` to a BNB Chain RPC provider that supports
+historical `eth_getLogs`. [BNB Chain's public endpoint documentation](https://docs.bnbchain.org/bnb-smart-chain/developers/json_rpc/json-rpc-endpoint/)
+notes that `eth_getLogs` is disabled on its listed mainnet public dataseed
+endpoints; it lists third-party providers for log access.
 
 ## Data and logs
 
@@ -149,7 +160,7 @@ The scanner logs the provider error and the block range it was attempting.
 | Symptom | What to check |
 |---|---|
 | `/scannft` gets no response | Confirm `execution_worker.py` is running, the bot token and chat ID are correct, and no webhook or other long-polling process is using the token. |
-| NFT monitor reports `limit exceeded` | Set `BSC_HTTP_URL` to a provider with a higher `eth_getLogs` limit and retry `/scannft`. The checkpoint is only advanced after successful ranges. |
+| NFT monitor reports `limit exceeded` | Configure `BSC_HISTORY_API_KEY` (or `ETHERSCAN_API_KEY`) for indexed NFT-history fallback, or set `BSC_HTTP_URL` to a provider that supports historical `eth_getLogs`; retry `/scannft`. |
 | Live mint alerts do not arrive | Check `BSC_WSS_URL`, WebSocket availability, and the scanner service logs. |
 | Wallet minting is unavailable | Check that `npm ci` succeeded, the wallet is connected, `MY_AGENTIC_WALLET` matches the connected BNB Chain address, and Developer Mode is active. |
 | Quality source check is unavailable | Set a valid `ETHERSCAN_API_KEY`; other on-chain quality checks can still run. |

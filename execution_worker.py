@@ -8,6 +8,7 @@ Environment: Pterodactyl / Docker on bot-hosting.net
 import os
 import sys
 import io
+import html
 import json
 import time
 import asyncio
@@ -81,7 +82,19 @@ _background_tasks: set = set()
 def spawn(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    def report_task_result(completed_task: asyncio.Task) -> None:
+        _background_tasks.discard(completed_task)
+        if completed_task.cancelled():
+            return
+        error = completed_task.exception()
+        if error is not None:
+            logger.error(
+                "Background task failed.",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(report_task_result)
     return task
 
 
@@ -659,6 +672,7 @@ async def poll_db_auto_mints():
 
 
 async def poll_telegram_updates():
+    global manual_nft_scan_requested
     offset = 0
     logger.info("Telegram Callback Listener active.")
     while True:
@@ -706,10 +720,55 @@ async def poll_telegram_updates():
                             except Exception as ex:
                                 logger.error(f"Failed to regenerate QR code: {ex}")
                     elif "message" in update:
-                        await telegram_nft_features.handle_message(update["message"])
+                        message = update["message"]
+                        text = message.get("text", "")
+                        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+                        if command == "/scannft":
+                            if str((message.get("chat") or {}).get("id")) != str(TELEGRAM_CHAT_ID):
+                                continue
+                            if nft_chain_monitor is None:
+                                await telegram_service.send_message(
+                                    "❌ NFT monitor is disabled. Configure a valid MY_AGENTIC_WALLET address first."
+                                )
+                                continue
+                            if manual_nft_scan_lock.locked() or manual_nft_scan_requested:
+                                await telegram_service.send_message(
+                                    "⏳ An NFT scan is already running; please wait for its report."
+                                )
+                                continue
+                            manual_nft_scan_requested = True
+                            spawn(run_manual_nft_scan())
+                        else:
+                            await telegram_nft_features.handle_message(message)
         except Exception as e:
             logger.error(f"Error in Telegram Polling: {e}")
             await asyncio.sleep(5)
+
+
+manual_nft_scan_lock = asyncio.Lock()
+manual_nft_scan_requested = False
+
+
+async def run_manual_nft_scan() -> None:
+    global manual_nft_scan_requested
+    if nft_chain_monitor is None:
+        manual_nft_scan_requested = False
+        return
+    try:
+        async with manual_nft_scan_lock:
+            await telegram_service.send_message(
+                "🔎 Starting an on-chain NFT scan. The first run may take longer while it indexes the wallet's history."
+            )
+            scan = await nft_chain_monitor.scan_now()
+            await nft_chain_monitor.send_scan_report(scan)
+    except Exception as error:
+        logger.exception("Manual NFT scan failed.")
+        await telegram_service.send_message(
+            "❌ NFT scan failed. Check the worker logs for details.\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+    finally:
+        manual_nft_scan_requested = False
 
 
 async def main():

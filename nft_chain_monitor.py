@@ -49,6 +49,7 @@ class NftChainMonitor:
         self.chain_name = chain_name
         self.explorer_base_url = explorer_base_url.rstrip("/")
         self.token_metadata: dict[str, tuple[str, int]] = {}
+        self._scan_lock = asyncio.Lock()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30.0)
@@ -396,6 +397,80 @@ class NftChainMonitor:
         for message in messages:
             await self.telegram_service.send_message(message)
 
+    async def scan_now(self) -> dict[str, int]:
+        self.initialize()
+        async with self._scan_lock:
+            latest_block = await asyncio.to_thread(lambda: self.web3.eth.block_number)
+            last_scanned = self._get_state("last_scanned_block")
+            last_scanned_block = int(last_scanned) if last_scanned is not None else -1
+            start_block = last_scanned_block + 1
+            completed_initial_scan = self._get_state("initial_scan_complete") == "1"
+
+            while last_scanned_block < latest_block:
+                logs, scanned_to = await self._scan_range(
+                    last_scanned_block + 1, latest_block
+                )
+                self._apply_logs(logs, scanned_to)
+                last_scanned_block = scanned_to
+                if completed_initial_scan:
+                    await self._notify_movements(logs)
+                await self._send_progress(last_scanned_block, latest_block)
+
+            initial_scan_completed = not completed_initial_scan
+            if initial_scan_completed:
+                self._set_state("initial_scan_complete", "1")
+
+            return {
+                "start_block": start_block,
+                "end_block": latest_block,
+                "scanned_blocks": max(0, latest_block - start_block + 1),
+                "holding_count": len(self._get_holdings()),
+                "initial_scan_completed": int(initial_scan_completed),
+                "initial_scan_complete": int(
+                    self._get_state("initial_scan_complete") == "1"
+                ),
+            }
+
+    async def send_scan_report(self, scan: dict[str, int]) -> None:
+        holdings = self._get_holdings()
+        block_summary = (
+            f"<b>Blocks scanned:</b> {scan['scanned_blocks']} "
+            f"({scan['start_block']}–{scan['end_block']})\n"
+            if scan["scanned_blocks"]
+            else "<b>Blocks scanned:</b> No new blocks\n"
+        )
+        header = (
+            "📊 <b>NFT scan complete</b>\n"
+            f"<b>Wallet:</b> <code>{self.wallet_address}</code>\n"
+            f"<b>Network:</b> {self.chain_name}\n"
+            f"<b>Latest block:</b> {scan['end_block']}\n"
+            f"{block_summary}"
+            f"<b>NFT token IDs held:</b> {scan['holding_count']}\n"
+            "<i>On-chain holdings only; floor prices are not included.</i>"
+        )
+        if not holdings:
+            await self.telegram_service.send_message(
+                f"{header}\n\nNo ERC-721/ERC-1155 holdings were found."
+            )
+            return
+
+        messages = []
+        current = header
+        for contract, token_id, standard, quantity in holdings:
+            line = (
+                f"• {standard} <code>{contract}</code> token "
+                f"<code>{token_id}</code> × {quantity}"
+            )
+            if len(current) + len(line) + 1 > 3500:
+                messages.append(current)
+                current = f"📊 <b>Holdings (continued)</b>\n{line}"
+            else:
+                current += f"\n{line}"
+        if current:
+            messages.append(current)
+        for message in messages:
+            await self.telegram_service.send_message(message)
+
     async def _send_progress(self, current: int, end: int) -> None:
         if current == 0 or current >= end or current % 1_000_000 < INITIAL_BLOCK_RANGE:
             logger.info(
@@ -426,12 +501,6 @@ class NftChainMonitor:
 
     async def run(self) -> None:
         self.initialize()
-        completed_initial_scan = self._get_state("initial_scan_complete") == "1"
-        last_scanned = self._get_state("last_scanned_block")
-        if last_scanned is None:
-            last_scanned_block = -1
-        else:
-            last_scanned_block = int(last_scanned)
         next_summary_at = 0.0
         logger.info(
             "Starting on-chain NFT monitor for %s (%s).",
@@ -440,31 +509,15 @@ class NftChainMonitor:
         )
         while True:
             try:
-                latest_block = await asyncio.to_thread(lambda: self.web3.eth.block_number)
-                if last_scanned_block < latest_block:
-                    logs, scanned_to = await self._scan_range(
-                        last_scanned_block + 1, latest_block
-                    )
-                    self._apply_logs(logs, scanned_to)
-                    last_scanned_block = scanned_to
-
-                    if completed_initial_scan:
-                        await self._notify_movements(logs)
-                    elif last_scanned_block >= latest_block:
-                        completed_initial_scan = True
-                        self._set_state("initial_scan_complete", "1")
-                        await self._send_holdings_summary(initial=True)
-                        next_summary_at = time.monotonic() + SUMMARY_INTERVAL
-                    await self._send_progress(last_scanned_block, latest_block)
-                    continue
-
-                if not completed_initial_scan:
-                    completed_initial_scan = True
-                    self._set_state("initial_scan_complete", "1")
+                scan = await self.scan_now()
+                if scan["initial_scan_completed"]:
                     await self._send_holdings_summary(initial=True)
                     next_summary_at = time.monotonic() + SUMMARY_INTERVAL
-
-                if time.monotonic() >= next_summary_at:
+                elif not scan["initial_scan_complete"]:
+                    next_summary_at = 0.0
+                elif next_summary_at == 0.0:
+                    next_summary_at = time.monotonic() + SUMMARY_INTERVAL
+                elif time.monotonic() >= next_summary_at:
                     await self._send_holdings_summary(initial=False)
                     next_summary_at = time.monotonic() + SUMMARY_INTERVAL
                 await asyncio.sleep(15)
@@ -472,7 +525,6 @@ class NftChainMonitor:
                 raise
             except Exception:
                 logger.exception(
-                    "On-chain NFT scan failed at block %s; retrying after 60 seconds.",
-                    last_scanned_block + 1,
+                    "On-chain NFT scan failed; retrying after 60 seconds."
                 )
                 await asyncio.sleep(60)

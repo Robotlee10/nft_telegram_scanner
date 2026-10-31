@@ -104,18 +104,13 @@ class NftChainMonitor:
             connection.close()
 
     def _query_logs(self, from_block: int, to_block: int) -> list:
-        event_topics = [ERC721_TRANSFER, ERC1155_TRANSFER_SINGLE, ERC1155_TRANSFER_BATCH]
         queries = (
-            {"topics": [event_topics, self.wallet_topic]},
-            {"topics": [event_topics, None, self.wallet_topic]},
-            {
-                "topics": [
-                    [ERC1155_TRANSFER_SINGLE, ERC1155_TRANSFER_BATCH],
-                    None,
-                    None,
-                    self.wallet_topic,
-                ]
-            },
+            [ERC721_TRANSFER, self.wallet_topic],
+            [ERC721_TRANSFER, None, self.wallet_topic],
+            [ERC1155_TRANSFER_SINGLE, None, self.wallet_topic],
+            [ERC1155_TRANSFER_SINGLE, None, None, self.wallet_topic],
+            [ERC1155_TRANSFER_BATCH, None, self.wallet_topic],
+            [ERC1155_TRANSFER_BATCH, None, None, self.wallet_topic],
         )
         logs = []
         seen: set[tuple[str, int]] = set()
@@ -124,7 +119,7 @@ class NftChainMonitor:
                 {
                     "fromBlock": from_block,
                     "toBlock": to_block,
-                    "topics": topics["topics"],
+                    "topics": topics,
                 }
             )
             for log in result:
@@ -487,17 +482,42 @@ class NftChainMonitor:
             try:
                 logs = await asyncio.to_thread(self._query_logs, start, range_end)
                 return logs, range_end
-            except Exception:
-                if range_size <= 1:
+            except Exception as error:
+                if not self._is_log_limit_error(error):
                     raise
+                if range_size <= 1:
+                    raise RuntimeError(
+                        "The BNB RPC provider rejected NFT log queries for a single "
+                        f"block ({start}) even after splitting filters by NFT event and "
+                        "wallet direction. Use a provider with a higher eth_getLogs "
+                        "response limit or retry this scan later."
+                    ) from error
                 range_size = max(1, range_size // 2)
                 logger.warning(
-                    "NFT log query failed for blocks %s-%s; retrying with a %s-block range.",
+                    "BNB RPC log-result limit reached for blocks %s-%s; retrying with "
+                    "a %s-block range.",
                     start,
                     range_end,
                     range_size,
-                    exc_info=True,
                 )
+
+    @staticmethod
+    def _is_log_limit_error(error: Exception) -> bool:
+        message = str(error).lower()
+        code = getattr(error, "code", None)
+        if code == -32005:
+            return True
+        return any(
+            phrase in message
+            for phrase in (
+                "limit exceeded",
+                "too many results",
+                "response size exceeded",
+                "query returned more than",
+                "block range is too wide",
+                "block range too large",
+            )
+        )
 
     async def run(self) -> None:
         self.initialize()

@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from hexbytes import HexBytes
 from web3 import Web3
-from web3.types import TxParams
+from web3.types import TxParams, Wei
 
 
 DIRECT_COMMAND_PATTERN = re.compile(
@@ -68,7 +68,54 @@ class PendingContractCall:
     request_id: str
     contract: str
     function_name: str
+    value_wei: int
     preview_expires_at: float
+
+
+def _parse_wei_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 0)
+        except ValueError:
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _preview_matches_mint(
+    parsed_tx: dict,
+    contract: str,
+    wallet: str,
+    calldata: str,
+    expected_value_wei: int,
+    chain_id: int,
+) -> bool:
+    target = parsed_tx.get("to")
+    sender = parsed_tx.get("from")
+    data = parsed_tx.get("inputData", parsed_tx.get("data"))
+    value = _parse_wei_value(parsed_tx.get("value"))
+    if (
+        not isinstance(target, str)
+        or target.lower() != contract.lower()
+        or not isinstance(sender, str)
+        or sender.lower() != wallet.lower()
+        or not isinstance(data, str)
+        or data.lower().removeprefix("0x") != calldata.lower().removeprefix("0x")
+        or value != expected_value_wei
+    ):
+        return False
+    parsed_chain_id = parsed_tx.get("binanceChainId", parsed_tx.get("chainId"))
+    if parsed_chain_id is not None:
+        parsed_chain_id_value = _parse_wei_value(parsed_chain_id)
+        if parsed_chain_id_value != chain_id:
+            return False
+    return True
 
 
 class TelegramNftFeatures:
@@ -84,6 +131,10 @@ class TelegramNftFeatures:
         chat_id: str,
         scan_contract: Callable[..., Any] | None = None,
         chain_id: int = 56,
+        mint_preflight: Callable[..., Any] | None = None,
+        verify_mint_transaction: Callable[..., Any] | None = None,
+        free_mint_only: bool = True,
+        max_mint_cost_wei: int = 0,
     ):
         self.telegram_service = telegram_service
         self.run_baw = run_baw
@@ -95,7 +146,26 @@ class TelegramNftFeatures:
         self.chat_id = str(chat_id)
         self.scan_contract = scan_contract
         self.chain_id = chain_id
+        self.mint_preflight = mint_preflight
+        self.verify_mint_transaction = verify_mint_transaction
+        self.free_mint_only = free_mint_only
+        self.max_mint_cost_wei = max_mint_cost_wei
         self.pending_calls: dict[str, PendingContractCall] = {}
+
+    def _mint_value_allowed(self, value_wei: int) -> bool:
+        if value_wei < 0:
+            return False
+        if self.free_mint_only:
+            return value_wei == 0
+        return value_wei <= self.max_mint_cost_wei
+
+    async def _run_mint_preflight(
+        self, contract: str, function_name: str, value_wei: int
+    ) -> dict | None:
+        if self.mint_preflight is None:
+            return None
+        result = await self.mint_preflight(contract, function_name, value_wei)
+        return result if isinstance(result, dict) else None
 
     def _is_authorized_chat(self, chat: dict | None) -> bool:
         return bool(chat and str(chat.get("id")) == self.chat_id)
@@ -145,6 +215,30 @@ class TelegramNftFeatures:
             value_wei = self.web3.to_wei(Decimal(match.group("value")), "ether")
         except (InvalidOperation, ValueError):
             await self.telegram_service.send_message("❌ Invalid BNB value in the command.")
+            return True
+        if not self._mint_value_allowed(value_wei):
+            await self.telegram_service.send_message(
+                "❌ Mint value exceeds the configured policy: "
+                f"{'free mints only' if self.free_mint_only else 'configured maximum cost'}."
+            )
+            return True
+
+        try:
+            preflight = await self._run_mint_preflight(
+                contract, function_name, value_wei
+            )
+        except Exception as error:
+            logger.exception("Could not verify mint safety before direct preview.")
+            await self.telegram_service.send_message(
+                f"❌ Mint safety preflight failed closed: <code>{html.escape(str(error))}</code>"
+            )
+            return True
+        if not preflight or preflight.get("safe") is not True:
+            blockers = (preflight or {}).get("blockers", ["Mint safety preflight unavailable."])
+            await self.telegram_service.send_message(
+                "❌ Mint blocked by safety preflight:\n"
+                + "\n".join(f"• {html.escape(str(item))}" for item in blockers)
+            )
             return True
 
         try:
@@ -240,6 +334,20 @@ class TelegramNftFeatures:
                 preview,
             )
             return True
+        if not _preview_matches_mint(
+            preview["parsedTx"],
+            contract,
+            self.wallet_address,
+            calldata,
+            value_wei,
+            self.chain_id,
+        ):
+            await self._send_json_parts(
+                "❌ Preview transaction does not match the requested contract, wallet, "
+                "function, value, and chain; nothing was executed.",
+                preview,
+            )
+            return True
 
         expiration = preview.get("expiresAt")
         if not isinstance(expiration, (int, float)):
@@ -252,14 +360,22 @@ class TelegramNftFeatures:
             request_id=request_id,
             contract=contract,
             function_name=function_name,
+            value_wei=value_wei,
             preview_expires_at=float(expiration),
         )
 
         await self._send_preview(preview)
+        warnings = preflight.get("warnings", [])
+        warning_text = ""
+        if warnings:
+            warning_text = "\n\n⚠️ <b>Contract review warnings:</b>\n" + "\n".join(
+                f"• {html.escape(str(item))}" for item in warnings
+            )
         await self.telegram_service.send_message(
             "✅ The contract reports ERC-721 support and the mint call simulated successfully. "
             "Review the preview above, then confirm to execute. The simulation cannot guarantee "
-            "the eventual on-chain result.",
+            "the eventual on-chain result."
+            + warning_text,
             reply_markup={
                 "inline_keyboard": [[
                     {
@@ -310,6 +426,8 @@ class TelegramNftFeatures:
         )
         quality_report = assessment["quality_report"]
         details = quality_report["details"]
+        mint_conditions = assessment.get("mint_conditions", {})
+        condition_values = mint_conditions.get("values", {})
         message = (
             "🔎 <b>NFT contract scan</b>\n\n"
             f"<b>Contract:</b> <code>{html.escape(contract)}</code>\n"
@@ -317,20 +435,26 @@ class TelegramNftFeatures:
             f"<b>Access gate:</b> {access_gate}\n"
             f"<b>Mint function:</b> {escaped_function}\n"
             f"<b>Quality score:</b> {html.escape(quality_report['score_str'])}\n"
-            f"<b>Auto-mint rule:</b> &gt;={assessment['auto_mint_threshold']}/7 "
-            f"(or {assessment['auto_mint_threshold'] - 1}/7 with verified source and scarce supply), "
-            "plus an exclusive access gate\n"
-            f"1️⃣ Activity: {html.escape(str(details.get('1_activity', 'Not checked')))}\n"
-            f"2️⃣ Metadata: {html.escape(str(details.get('2_metadata', 'Not checked')))}\n"
-            f"3️⃣ Source: {html.escape(str(details.get('3_source', 'Not checked')))}\n"
-            f"4️⃣ Diversity: {html.escape(str(details.get('4_diversity', 'Not checked')))}\n"
-            f"5️⃣ Royalty: {html.escape(str(details.get('5_royalty', 'Not checked')))}\n"
-            f"6️⃣ Supply: {html.escape(str(details.get('6_supply', 'Not checked')))}\n"
-            f"7️⃣ Minter profile: {html.escape(str(details.get('7_minter', 'Not checked')))}\n"
+            f"<b>Auto-mint rule:</b> all 4 technical checks, all required safety "
+            "checks, plus an explicitly verified access gate\n"
+            f"1️⃣ Metadata: {html.escape(str(details.get('1_metadata', 'Not checked')))}\n"
+            f"2️⃣ Source: {html.escape(str(details.get('2_source', 'Not checked')))}\n"
+            f"3️⃣ Proxy: {html.escape(str(details.get('3_proxy', 'Not checked')))}\n"
+            f"4️⃣ Admin controls: {html.escape(str(details.get('4_admin_controls', 'Not checked')))}\n"
+            f"5️⃣ Activity: {html.escape(str(details.get('5_activity', 'Not checked')))}\n"
+            f"6️⃣ Distribution: {html.escape(str(details.get('6_distribution', 'Not checked')))}\n"
+            f"7️⃣ Supply/royalties: {html.escape(str(details.get('7_supply_and_royalties', 'Not checked')))}\n"
+            f"💰 Mint cost policy: {html.escape(str(assessment.get('mint_cost_policy', 'Not checked')))}\n"
+            f"🧪 Live getters (unknown if unexposed): "
+            f"<code>{html.escape(json.dumps(condition_values, default=str))}</code>\n"
         )
 
-        if assessment.get("already_owned"):
+        if assessment.get("already_owned") is True:
             message += "\nℹ️ This wallet already holds this NFT; no mint was queued."
+            await self.telegram_service.send_message(message)
+            return
+        if assessment.get("already_owned") is None:
+            message += "\n⛔ Wallet ownership could not be verified; mint actions are disabled."
             await self.telegram_service.send_message(message)
             return
 
@@ -344,10 +468,25 @@ class TelegramNftFeatures:
         elif not function_name:
             message += "\n❌ No supported mint call passed simulation; no mint action is available."
         else:
-            message += "\nℹ️ This candidate did not meet the automatic-mint criteria; you can choose to mint manually."
+            message += "\nℹ️ This candidate did not meet automatic-mint criteria."
+
+        blockers = assessment.get("blockers", [])
+        if blockers:
+            message += "\n\n⛔ <b>Mint blockers:</b>\n" + "\n".join(
+                f"• {html.escape(str(blocker))}" for blocker in blockers
+            )
+        warnings = assessment.get("warnings", [])
+        if warnings:
+            message += "\n\n⚠️ <b>Quality warnings:</b>\n" + "\n".join(
+                f"• {html.escape(str(warning))}" for warning in warnings
+            )
 
         reply_markup = None
-        if function_name and queue_status not in {"queued", "already_exists"}:
+        if (
+            function_name
+            and assessment.get("safe") is True
+            and queue_status not in {"queued", "already_exists"}
+        ):
             reply_markup = {
                 "inline_keyboard": [[
                     {
@@ -417,10 +556,25 @@ class TelegramNftFeatures:
         await self.telegram_service.answer_callback(
             callback_query["id"], "Checking NFT standard and preparing preview..."
         )
+        try:
+            preflight = await self._run_mint_preflight(contract, function_name, 0)
+        except Exception as error:
+            logger.exception("Could not verify safety before manual NFT preview.")
+            await self.telegram_service.send_message(
+                f"❌ Mint safety preflight failed closed: <code>{html.escape(str(error))}</code>"
+            )
+            return True
+        if not preflight or preflight.get("safe") is not True:
+            blockers = (preflight or {}).get("blockers", ["Mint safety preflight unavailable."])
+            await self.telegram_service.send_message(
+                "❌ Mint blocked by safety preflight:\n"
+                + "\n".join(f"• {html.escape(str(item))}" for item in blockers)
+            )
+            return True
         transaction: TxParams = {
             "from": self.web3.to_checksum_address(self.wallet_address),
             "to": contract,
-            "value": 0,
+            "value": Wei(0),
             "data": HexBytes(calldata),
         }
         try:
@@ -505,6 +659,20 @@ class TelegramNftFeatures:
                 preview,
             )
             return True
+        if not _preview_matches_mint(
+            preview["parsedTx"],
+            contract,
+            self.wallet_address,
+            calldata,
+            0,
+            self.chain_id,
+        ):
+            await self._send_json_parts(
+                "❌ Preview transaction does not match the NFT contract, wallet, "
+                "function, value, and chain; nothing was executed.",
+                preview,
+            )
+            return True
 
         expiration = preview.get("expiresAt")
         if not isinstance(expiration, (int, float)):
@@ -517,12 +685,20 @@ class TelegramNftFeatures:
             request_id=request_id,
             contract=contract,
             function_name=function_name,
+            value_wei=0,
             preview_expires_at=float(expiration),
         )
         await self._send_preview(preview)
+        warnings = preflight.get("warnings", [])
+        warning_text = ""
+        if warnings:
+            warning_text = "\n\n⚠️ <b>Automatic-mint checks:</b>\n" + "\n".join(
+                f"• {html.escape(str(item))}" for item in warnings
+            )
         await self.telegram_service.send_message(
             "✅ The NFT standard and mint-call simulation passed. Review the preview above, "
-            "then confirm to execute. The simulation cannot guarantee the eventual on-chain result.",
+            "then confirm to execute. The simulation cannot guarantee the eventual on-chain result."
+            + warning_text,
             reply_markup={
                 "inline_keyboard": [[
                     {
@@ -591,8 +767,31 @@ class TelegramNftFeatures:
                 "❌ Binance Agentic Wallet is no longer connected; nothing was executed."
             )
             return True
+        if not self.wallet_address:
+            await self.telegram_service.answer_callback(
+                callback_query["id"], "Wallet address is unavailable."
+            )
+            await self.telegram_service.send_message(
+                "❌ Configured wallet address is unavailable; nothing was executed."
+            )
+            return True
 
         try:
+            preflight = await self._run_mint_preflight(
+                pending.contract, pending.function_name, pending.value_wei
+            )
+            if not preflight or preflight.get("safe") is not True:
+                blockers = (preflight or {}).get(
+                    "blockers", ["Mint safety preflight unavailable."]
+                )
+                await self.telegram_service.answer_callback(
+                    callback_query["id"], "Safety checks no longer pass."
+                )
+                await self.telegram_service.send_message(
+                    "❌ Mint cancelled because fresh safety checks failed:\n"
+                    + "\n".join(f"• {html.escape(str(item))}" for item in blockers)
+                )
+                return True
             settings = await self.run_baw(["wallet", "settings", "--json"])
             if not developer_mode_is_active(settings):
                 await self.telegram_service.answer_callback(
@@ -623,13 +822,23 @@ class TelegramNftFeatures:
                 )
                 return True
 
-            success, block_number, detail = await self.verify_transaction(tx_hash)
+            if self.verify_mint_transaction is None:
+                success, block_number, detail = (
+                    False,
+                    None,
+                    "NFT transfer verification is unavailable.",
+                )
+            else:
+                success, block_number, detail = await self.verify_mint_transaction(
+                    tx_hash, pending.contract, self.wallet_address
+                )
             if success:
                 await self.telegram_service.send_message(
                     "🟢 <b>Contract call executed successfully.</b>\n"
                     f"<b>Function:</b> <code>{html.escape(pending.function_name)}</code>\n"
                     f"<b>Contract:</b> <code>{html.escape(pending.contract)}</code>\n"
                     f"<b>Block:</b> <code>{html.escape(str(block_number))}</code>\n"
+                    f"<b>Mint verification:</b> {html.escape(detail)}\n"
                     f"<b>Transaction:</b> https://bscscan.com/tx/{html.escape(tx_hash)}"
                 )
             else:

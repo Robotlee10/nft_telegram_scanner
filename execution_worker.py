@@ -16,7 +16,7 @@ import sqlite3
 import logging
 import shutil
 import subprocess
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import httpx
 import qrcode
@@ -25,7 +25,11 @@ from web3 import Web3
 from dotenv import load_dotenv
 import nft_telegram_scanner as nft_scanner
 from nft_chain_monitor import NftChainMonitor
-from telegram_nft_features import TelegramNftFeatures, developer_mode_is_active
+from telegram_nft_features import (
+    TelegramNftFeatures,
+    _preview_matches_mint,
+    developer_mode_is_active,
+)
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -118,8 +122,20 @@ def init_db():
                 order_id TEXT,
                 error_log TEXT,
                 scarcity_source_override INTEGER NOT NULL DEFAULT 0,
+                safety_approved INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 executed_at TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS verified_mints (
+                transaction_hash TEXT NOT NULL,
+                contract_address TEXT NOT NULL,
+                wallet_address TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                block_number INTEGER,
+                verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (transaction_hash, contract_address, wallet_address, token_id)
             )
         """)
         columns = {
@@ -130,6 +146,10 @@ def init_db():
         if "scarcity_source_override" not in columns:
             cursor.execute(
                 "ALTER TABLE mints ADD COLUMN scarcity_source_override INTEGER NOT NULL DEFAULT 0"
+            )
+        if "safety_approved" not in columns:
+            cursor.execute(
+                "ALTER TABLE mints ADD COLUMN safety_approved INTEGER NOT NULL DEFAULT 0"
             )
         conn.commit()
         conn.close()
@@ -392,6 +412,22 @@ async def execute_agentic_mint(
         return "blocked", "MY_AGENTIC_WALLET is not configured in .env."
 
     try:
+        preflight = await preflight_mint(contract_address, function_name, 0)
+        if (
+            preflight.get("safe") is not True
+            or preflight.get("auto_mint_eligible") is not True
+        ):
+            reasons = preflight.get("blockers") or preflight.get("warnings") or [
+                "Fresh automatic-mint safety checks did not pass."
+            ]
+            reason = "; ".join(str(item) for item in reasons)
+            await telegram_service.send_message(
+                f"⛔ <b>Auto-mint blocked by fresh safety checks.</b>\n"
+                f"<b>Contract:</b> <code>{contract_address}</code>\n"
+                f"<b>Reason:</b> {html.escape(reason)}"
+            )
+            return "blocked", reason
+
         settings = await run_baw(["wallet", "settings", "--json"])
         if not developer_mode_is_active(settings):
             error = (
@@ -437,6 +473,33 @@ async def execute_agentic_mint(
                 f"<b>Contract:</b> <code>{contract_address}</code>\n{error}"
             )
             return "failed", error
+        if not _preview_matches_mint(
+            preview["parsedTx"],
+            contract_address,
+            wallet_address,
+            calldata,
+            0,
+            BSC_CHAIN_ID,
+        ):
+            error = (
+                "Preview transaction did not match the configured wallet, NFT contract, "
+                "mint function, zero value, and BNB Chain."
+            )
+            await telegram_service.send_message(
+                f"❌ <b>Mint preview rejected ({trigger_source}).</b>\n"
+                f"<b>Contract:</b> <code>{contract_address}</code>\n{error}"
+            )
+            return "failed", error
+        if _preview_reports_risk(preview):
+            error = (
+                "Wallet preview reported risk details or authority changes; "
+                "automatic minting requires manual review."
+            )
+            await telegram_service.send_message(
+                f"⛔ <b>Auto-mint blocked by wallet preview.</b>\n"
+                f"<b>Contract:</b> <code>{contract_address}</code>\n{error}"
+            )
+            return "blocked", error
 
         logger.info(f"Preview passed for {contract_address}. Executing autonomously...")
 
@@ -453,7 +516,9 @@ async def execute_agentic_mint(
             return "failed", f"Execution did not broadcast. Status: {execution_status}"
 
         # 3. Verify transaction outcome on-chain and report back to Telegram
-        receipt_success, block_num, err_detail = await verify_tx_on_chain(tx_hash)
+        receipt_success, block_num, err_detail = await verify_mint_transaction(
+            tx_hash, contract_address, wallet_address
+        )
         bscscan_link = f"https://bscscan.com/tx/{tx_hash}"
 
         if receipt_success:
@@ -463,6 +528,7 @@ async def execute_agentic_mint(
                 f"<b>Function:</b> <code>{function_name}</code>\n"
                 f"<b>Source:</b> {trigger_source}\n"
                 f"<b>Block:</b> {block_num}\n"
+                f"<b>Mint verification:</b> {html.escape(err_detail)}\n"
                 f"🔗 <a href='{bscscan_link}'>View on BscScan</a>"
             )
             return "success", tx_hash
@@ -498,58 +564,271 @@ async def verify_tx_on_chain(tx_hash: str) -> Tuple[bool, Optional[int], str]:
                     return True, receipt.get("blockNumber"), "Success"
                 else:
                     return False, receipt.get("blockNumber"), "Execution Reverted on-chain"
-        except Exception:
-            pass
+        except Exception as error:
+            logger.debug("Receipt check failed for %s: %s", tx_hash, error)
         await asyncio.sleep(RPC_POLL_INTERVAL)
     return False, None, f"Receipt Timeout ({RPC_RECEIPT_TIMEOUT}s expired)"
 
 
-async def scan_telegram_contract(contract_address: str) -> dict:
+ERC721_TRANSFER_TOPIC = HexBytes(
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+)
+ERC1155_TRANSFER_SINGLE_TOPIC = HexBytes(
+    "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+)
+ERC1155_TRANSFER_BATCH_TOPIC = HexBytes(
+    "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
+)
+
+
+def _topic_address(topic: Any) -> str:
+    return "0x" + bytes(topic)[-20:].hex()
+
+
+def _preview_reports_risk(preview: dict) -> bool:
+    simulation = preview.get("simulationResult")
+    values = (
+        preview.get("risks"),
+        preview.get("authorityChanges"),
+        simulation.get("authorityChanges") if isinstance(simulation, dict) else None,
+    )
+    return any(value not in (None, [], {}, "", False) for value in values)
+
+
+def _mint_transfers_from_receipt(
+    receipt: Any, contract_address: str, wallet_address: str
+) -> list[int]:
+    token_ids = []
+    target = contract_address.lower()
+    wallet = wallet_address.lower()
+    zero = "0x" + "0" * 40
+    for log in receipt.get("logs", []):
+        if str(log.get("address", "")).lower() != target:
+            continue
+        topics = log.get("topics", [])
+        if not topics:
+            continue
+        event_topic = HexBytes(topics[0])
+        if event_topic == ERC721_TRANSFER_TOPIC and len(topics) == 4:
+            if _topic_address(topics[1]) == zero and _topic_address(topics[2]) == wallet:
+                token_ids.append(int.from_bytes(bytes(topics[3]), "big"))
+        elif (
+            event_topic == ERC1155_TRANSFER_SINGLE_TOPIC
+            and len(topics) == 4
+            and _topic_address(topics[2]) == zero
+            and _topic_address(topics[3]) == wallet
+        ):
+            decoded = w3.codec.decode(
+                ["uint256", "uint256"], bytes(HexBytes(log.get("data", "0x")))
+            )
+            if int(decoded[1]) > 0:
+                token_ids.append(int(decoded[0]))
+        elif (
+            event_topic == ERC1155_TRANSFER_BATCH_TOPIC
+            and len(topics) == 4
+            and _topic_address(topics[2]) == zero
+            and _topic_address(topics[3]) == wallet
+        ):
+            decoded = w3.codec.decode(
+                ["uint256[]", "uint256[]"], bytes(HexBytes(log.get("data", "0x")))
+            )
+            token_ids.extend(
+                int(token_id)
+                for token_id, amount in zip(decoded[0], decoded[1])
+                if int(amount) > 0
+            )
+    return token_ids
+
+
+def _record_verified_mint(
+    tx_hash: str,
+    contract_address: str,
+    wallet_address: str,
+    token_ids: list[int],
+    block_number: int | None,
+) -> None:
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
+    try:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO verified_mints (
+                transaction_hash, contract_address, wallet_address, token_id, block_number
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    tx_hash.lower(),
+                    contract_address.lower(),
+                    wallet_address.lower(),
+                    str(token_id),
+                    block_number,
+                )
+                for token_id in sorted(set(token_ids))
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def verify_mint_transaction(
+    tx_hash: str, contract_address: str, wallet_address: str
+) -> Tuple[bool, Optional[int], str]:
+    receipt_success, block_num, detail = await verify_tx_on_chain(tx_hash)
+    if not receipt_success:
+        return False, block_num, detail
+    try:
+        receipt = await asyncio.to_thread(
+            w3.eth.get_transaction_receipt, HexBytes(tx_hash)
+        )
+        token_ids = _mint_transfers_from_receipt(
+            receipt, contract_address, wallet_address
+        )
+    except Exception as error:
+        logger.exception("Could not verify NFT transfer logs for %s.", tx_hash)
+        return False, block_num, f"Receipt NFT-transfer verification failed: {error}"
+    if not token_ids:
+        return (
+            False,
+            block_num,
+            "Receipt succeeded but contains no NFT mint transfer from zero address "
+            "to the configured wallet for this contract.",
+        )
+    unique_ids = sorted(set(token_ids))
+    try:
+        await asyncio.to_thread(
+            _record_verified_mint,
+            tx_hash,
+            contract_address,
+            wallet_address,
+            unique_ids,
+            block_num,
+        )
+    except sqlite3.Error as error:
+        logger.exception("Could not persist verified mint audit for %s.", tx_hash)
+        return False, block_num, f"On-chain mint transfer verified, but audit persistence failed: {error}"
+    ids_text = ", ".join(map(str, unique_ids))
+    return True, block_num, f"Mint transfer confirmed; token ID(s): {ids_text}."
+
+
+async def assess_contract(
+    contract_address: str,
+    function_name: str | None = None,
+    mint_value_wei: int = 0,
+) -> dict:
     is_nft, nft_standard = await nft_scanner.verify_is_nft_contract(contract_address)
     if not is_nft:
-        return {"is_nft": False}
+        return {
+            "is_nft": False,
+            "nft_standard": nft_standard,
+            "already_owned": None,
+            "blockers": ["NFT standard could not be verified."],
+            "safe": False,
+        }
 
     already_owned = await nft_scanner.already_owns_nft(contract_address)
-    function_name, is_exclusive, access_reason = await nft_scanner.inspect_mint_access(
-        contract_address
+    simulated_function, is_exclusive, access_reason = await nft_scanner.inspect_mint_access(
+        contract_address, mint_value_wei
     )
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    function_matches = bool(
+        simulated_function
+        and (function_name is None or simulated_function == function_name)
+    )
+    if function_name is None:
+        function_name = simulated_function
+    mint_conditions = (
+        await nft_scanner.inspect_mint_conditions(
+            contract_address, mint_value_wei
+        )
+        if function_matches
+        else {"safe": False, "blockers": ["Requested mint function did not simulate."]}
+    )
+    async with httpx.AsyncClient(follow_redirects=False) as client:
         quality_report = await nft_scanner.run_quality_checks(
             client,
             contract_address,
             tx_hash=None,
         )
 
+    nft_scanner.add_required_mint_checks(
+        quality_report,
+        ownership_verified=already_owned is False,
+        access_gate_verified=is_exclusive and function_matches,
+        live_conditions_safe=bool(mint_conditions["safe"]),
+        mint_cost_allowed=nft_scanner.is_mint_cost_allowed(mint_value_wei),
+    )
+    blockers = []
+    if already_owned is True:
+        blockers.append("Configured wallet already owns an NFT from this contract.")
+    elif already_owned is None:
+        blockers.append("Wallet ownership could not be verified.")
+    if not function_matches:
+        blockers.append("The requested mint function did not pass a current wallet simulation.")
+    if not nft_scanner.is_mint_cost_allowed(mint_value_wei):
+        blockers.append("Mint value exceeds the configured cost policy.")
+    blockers.extend(mint_conditions.get("blockers", []))
+    if nft_scanner.FREE_MINT_ONLY and mint_value_wei != 0:
+        blockers.append("Only free mints are allowed by configuration.")
+    safe_for_manual = not blockers
     auto_mint_eligible = bool(
-        not already_owned
+        safe_for_manual
         and is_exclusive
-        and function_name
         and nft_scanner.is_auto_mint_eligible(quality_report)
     )
-    queue_status = (
-        nft_scanner.queue_auto_mint(contract_address, function_name, quality_report)
-        if auto_mint_eligible and function_name
-        else None
-    )
-
-    if is_exclusive:
-        access_gate = f"Configured agent wallet only ({access_reason})"
-    elif function_name:
-        access_gate = f"Public mint ({access_reason})"
-    else:
-        access_gate = f"Not confirmed ({access_reason})"
-
     return {
         "is_nft": True,
         "nft_standard": nft_standard,
         "already_owned": already_owned,
-        "access_gate": access_gate,
+        "access_gate": (
+            f"Explicitly verified agent-wallet gate ({access_reason})"
+            if is_exclusive
+            else f"Not verified ({access_reason})"
+        ),
         "function_name": function_name,
+        "is_exclusive": is_exclusive,
+        "function_matches": function_matches,
+        "access_reason": access_reason,
+        "mint_conditions": mint_conditions,
+        "mint_cost_policy": nft_scanner.mint_cost_policy_description(),
         "quality_report": quality_report,
-        "auto_mint_threshold": nft_scanner.AUTO_MINT_THRESHOLD,
+        "safe": safe_for_manual,
+        "blockers": blockers,
+        "warnings": quality_report["auto_mint_blockers"],
         "auto_mint_eligible": auto_mint_eligible,
-        "queue_status": queue_status,
     }
+
+
+async def preflight_mint(
+    contract_address: str, function_name: str, mint_value_wei: int
+) -> dict:
+    assessment = await assess_contract(
+        contract_address, function_name, mint_value_wei
+    )
+    blockers = list(assessment.get("blockers", []))
+    assessment["blockers"] = blockers
+    assessment["safe"] = assessment.get("is_nft") is True and not blockers
+    return assessment
+
+
+async def scan_telegram_contract(contract_address: str, queue: bool = True) -> dict:
+    assessment = await assess_contract(contract_address)
+    if not assessment.get("is_nft"):
+        return assessment
+    function_name = assessment.get("function_name")
+    queue_status = None
+    if (
+        queue
+        and assessment.get("auto_mint_eligible")
+        and isinstance(function_name, str)
+    ):
+        queue_status = nft_scanner.queue_auto_mint(
+            contract_address, function_name, assessment["quality_report"]
+        )
+    assessment.update(
+        auto_mint_threshold=nft_scanner.AUTO_MINT_THRESHOLD,
+        queue_status=queue_status,
+    )
+    return assessment
 
 
 telegram_nft_features = TelegramNftFeatures(
@@ -563,6 +842,10 @@ telegram_nft_features = TelegramNftFeatures(
     chat_id=TELEGRAM_CHAT_ID,
     scan_contract=scan_telegram_contract,
     chain_id=BSC_CHAIN_ID,
+    mint_preflight=preflight_mint,
+    verify_mint_transaction=verify_mint_transaction,
+    free_mint_only=nft_scanner.FREE_MINT_ONLY,
+    max_mint_cost_wei=nft_scanner.MAX_MINT_COST_WEI,
 )
 
 nft_chain_monitor = (
@@ -582,7 +865,7 @@ nft_chain_monitor = (
 # ==========================================
 async def poll_db_auto_mints():
     logger.info(
-        "Reviewed Mint Queue active. Monitoring threshold-qualified and scarce verified-source NFTs..."
+        "Safety-approved mint queue active; legacy queue rows without fresh approval are ignored."
     )
     while True:
         if not wallet_ready.is_set():
@@ -595,16 +878,13 @@ async def poll_db_auto_mints():
                         UPDATE mints
                         SET error_log = ?
                         WHERE status = 'pending'
+                          AND safety_approved = 1
                           AND error_log IS NULL
-                          AND (
-                              quality_score >= ?
-                              OR (quality_score = ? AND scarcity_source_override = 1)
-                          )
+                          AND quality_score >= ?
                         """,
                         (
                             WALLET_NOT_CONNECTED_ERROR,
                             AUTO_MINT_THRESHOLD,
-                            AUTO_MINT_THRESHOLD - 1,
                         ),
                     )
                     conn.commit()
@@ -624,12 +904,10 @@ async def poll_db_auto_mints():
                 SELECT id, contract_address, function_name, quality_score
                 FROM mints
                 WHERE status = 'pending'
-                  AND (
-                      quality_score >= ?
-                      OR (quality_score = ? AND scarcity_source_override = 1)
-                  )
+                  AND safety_approved = 1
+                  AND quality_score >= ?
                 ORDER BY id ASC LIMIT 5
-            """, (AUTO_MINT_THRESHOLD, AUTO_MINT_THRESHOLD - 1))
+            """, (AUTO_MINT_THRESHOLD,))
             rows = cursor.fetchall()
 
             for row in rows:
@@ -637,7 +915,12 @@ async def poll_db_auto_mints():
                 contract = row["contract_address"]
                 func_name = row["function_name"]
                 score = row["quality_score"]
-                logger.info(f"Auto-minting Target ID #{mint_id} (Score: {score}/7)")
+                logger.info(
+                    "Auto-minting safety-approved queue record #%s (technical checks: %s/%s).",
+                    mint_id,
+                    score,
+                    AUTO_MINT_THRESHOLD,
+                )
                 cursor.execute(
                     "UPDATE mints SET status = 'processing', error_log = NULL WHERE id = ?",
                     (mint_id,),
@@ -647,7 +930,7 @@ async def poll_db_auto_mints():
                 status, result = await execute_agentic_mint(
                     contract,
                     func_name,
-                    trigger_source=f"AUTO (Score: {score}/7)",
+                    trigger_source=f"AUTO (Technical checks: {score}/4)",
                 )
 
                 now = time.strftime("%Y-%m-%d %H:%M:%S")

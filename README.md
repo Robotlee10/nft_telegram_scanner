@@ -7,15 +7,20 @@ NFTs through the Binance Agentic Wallet CLI.
 ## Features
 
 - Watches BNB Chain ERC-721 and ERC-1155 mint events over WebSocket.
-- Checks whether a candidate supports an NFT standard, whether the configured
-  wallet can call a supported mint function, and whether a control wallet is
-  blocked by the contract's access gate.
-- Scores candidates with seven quality checks: recent activity, metadata,
-  verified source, minter diversity, ERC-2981 royalties, supply cap, and minter
-  history.
-- Automatically queues exclusive candidates at 4/7 checks, or at 3/7 when both
-  source verification and scarce supply pass. The worker re-previews the call
-  before execution.
+- Checks whether a candidate supports ERC-721/ERC-1155, whether the configured
+  wallet can currently simulate a supported mint function, and whether a
+  control-wallet failure contains a recognizable access-denial reason.
+- Scores four technical checks: validated metadata and an available asset,
+  verified source/ABI, no detected proxy, and no recognized high-risk admin
+  controls. Activity, minter distribution, royalties, supply caps, and deployer
+  history are displayed as informational signals and do not increase the score.
+- Automatically queues only candidates that pass all four technical checks
+  plus ownership, explicit access-gate, live-call, mint-condition, and cost
+  safety checks. The worker repeats those checks and validates the exact wallet
+  preview immediately before execution.
+- Requires a successful receipt and an NFT mint-transfer event from the zero
+  address to the configured wallet before reporting mint success. Confirmed
+  token IDs and transaction hashes are saved in SQLite.
 - Sends Telegram alerts with a manual mint option for candidates that were not
   automatically queued. Manual minting requires a successful preview and a
   separate confirmation.
@@ -24,10 +29,13 @@ NFTs through the Binance Agentic Wallet CLI.
   return a holdings report. The initial scan may take a while; subsequent scans
   continue from the last saved block.
 
-The quality score is informational, not investment advice or a guarantee that a
-mint will succeed. A manual mint can still incur transaction fees. Automatic mint
-execution may submit an on-chain transaction once its configured eligibility
-checks and preview pass.
+The technical score is not investment advice and cannot guarantee that an NFT is
+valuable, safe, or desirable. Market activity, declared scarcity, and royalties
+can be manipulated or misrepresented. Proxy and privileged-control detection is
+heuristic and does not prove that a contract has no hidden risks. Automatic mint
+execution submits an on-chain transaction only after the configured hard gates
+and exact transaction preview pass; network state may still change before
+inclusion.
 
 ## Requirements
 
@@ -77,7 +85,7 @@ MY_AGENTIC_WALLET=0xYourBnbChainWalletAddress
 BSC_HTTP_URL=https://your-bnb-http-rpc
 BSC_WSS_URL=wss://your-bnb-websocket-rpc
 
-# Optional: used to check source-code verification in the quality score.
+# Required for automatic minting's verified-source/ABI safety gate.
 ETHERSCAN_API_KEY=your-etherscan-api-key
 
 # Optional: used as a fallback for wallet NFT history if eth_getLogs is capped.
@@ -86,7 +94,19 @@ BSC_HISTORY_API_KEY=your-etherscan-api-key
 
 # Optional: used as the comparison wallet for the exclusive mint access test.
 CONTROL_WALLET_NO_ID=0x0000000000000000000000000000000000000001
+
+# Mint cost policy. Defaults to free mints only.
+FREE_MINT_ONLY=true
+# Used only when FREE_MINT_ONLY=false; direct/manual mint commands are capped.
+MAX_MINT_COST_BNB=0.01
 ```
+
+`FREE_MINT_ONLY=true` is the default and blocks transactions with nonzero BNB
+value. Set it to `false` only if you explicitly want to allow manually specified
+mint values up to `MAX_MINT_COST_BNB`. Automatic queue mints always use zero BNB
+value. Zero BNB value does not rule out a contract attempting to transfer
+previously approved tokens; review the wallet preview and existing approvals.
+The maximum is a transaction-value cap, not a gas-fee cap.
 
 `TELEGRAM_CHAT_ID` is the only chat authorized to use `/scannft` and mint
 confirmation buttons. The bot uses Telegram long polling; do not run another
@@ -125,7 +145,50 @@ and each holding's contract, token ID, standard, and quantity. It does not repor
 market prices or floor prices.
 
 You can also send a bare BNB Chain contract address to Telegram to scan that
-contract's NFT standard, access gate, mint function, and quality score.
+contract's NFT standard, current mint simulation, ownership, access gate,
+metadata, source, proxy/admin controls, sale-state getters, and technical score.
+Unknown ownership, an unverified mint call, an over-policy price, a paused or
+closed sale, or a sold-out supply blocks mint actions. Generic reverts from a
+control wallet are not treated as proof of exclusivity.
+
+### Mint safety and score
+
+- Ownership checks are tri-state: owned, not owned, or unknown. RPC failures are
+  unknown and block automated and manual mint flows.
+- The wallet-ownership preflight currently requires ERC-721 `balanceOf(address)`.
+  ERC-1155 contracts are identified and reported, but mint actions are blocked
+  because this scanner does not yet aggregate all ERC-1155 token-ID balances.
+- Mint previews must match the configured wallet, target contract, calldata,
+  chain (when included by the wallet CLI), and exact BNB value.
+- Automatic minting is blocked when the wallet preview reports risk details or
+  authority changes; direct/manual calls show those details and still require
+  confirmation.
+- Common `paused`, sale-active, supply-cap, current-supply, and mint-price
+  getters are checked when the contract exposes them. The exact mint call is
+  also simulated immediately before execution. Getter availability varies;
+  absence is reported as unknown, not as evidence that the contract is safe.
+- Proxy inspection checks EIP-1967 implementation/admin/beacon slots and
+  EIP-1167 minimal proxies, including implementation/admin/beacon addresses when
+  exposed. A detected proxy blocks automatic minting. Verified ABIs are scanned
+  for owner status and upgrade, pause, blacklist, metadata, sale, price, supply,
+  role, and royalty setters; recognized high-risk controls block automatic minting.
+  Custom proxy patterns and unverified source may not be detected, and source
+  verification does not establish trustworthiness.
+- Metadata JSON is fetched with a 6-second timeout and a 512 KiB limit.
+  Redirects are rejected; external HTTPS hosts are rejected if DNS resolves to
+  non-public IP addresses. The first referenced image/asset is checked using a
+  1 KiB range request, with redirects and non-media content types rejected.
+  Metadata is not executed, and the scanner does not evaluate artistic quality.
+- Recent activity, recipient diversity, ERC-2981 support, supply caps, and
+  minter nonce are reported only as informational signals. They do not raise
+  the 0-to-4 technical score or bypass a safety gate.
+- A confirmed transaction must emit an ERC-721 `Transfer` or ERC-1155 transfer
+  event from the zero address to the configured wallet at the scanned contract.
+  The verified transaction and token IDs are stored in the `verified_mints`
+  database table.
+- Existing queued records from older versions are not trusted. Database
+  migration marks them unapproved; rescan the contract to qualify it under the
+  current safety checks.
 
 ## RPC log limits
 
@@ -148,8 +211,9 @@ endpoints; it lists third-party providers for log access.
 
 ## Data and logs
 
-- `agentic_mints.db` stores candidate mint status, scan checkpoints, and current
-  wallet holdings. It is created automatically and is excluded from Git.
+- `agentic_mints.db` stores candidate mint status, scan checkpoints, current
+  wallet holdings, and verified mint transaction/token IDs. It is created
+  automatically and is excluded from Git.
 - Service diagnostics are written to standard output. When using `runner.py`,
   monitor the runner output for scanner and worker errors.
 - Do not delete the database to troubleshoot RPC errors; doing so loses the
@@ -163,7 +227,7 @@ endpoints; it lists third-party providers for log access.
 | NFT monitor reports `limit exceeded` | Configure `BSC_HISTORY_API_KEY` (or `ETHERSCAN_API_KEY`) for indexed NFT-history fallback, or set `BSC_HTTP_URL` to a provider that supports historical `eth_getLogs`; retry `/scannft`. |
 | Live mint alerts do not arrive | Check `BSC_WSS_URL`, WebSocket availability, and the scanner service logs. |
 | Wallet minting is unavailable | Check that `npm ci` succeeded, the wallet is connected, `MY_AGENTIC_WALLET` matches the connected BNB Chain address, and Developer Mode is active. |
-| Quality source check is unavailable | Set a valid `ETHERSCAN_API_KEY`; other on-chain quality checks can still run. |
+| Automatic minting is not eligible | Check all four technical checks, wallet ownership, explicit access-gate evidence, live mint conditions, configured cost policy, and a valid `ETHERSCAN_API_KEY`. |
 
 ## Project files
 

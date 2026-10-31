@@ -86,6 +86,7 @@ ERC2981_ROYALTY_INTERFACE_ID = "0x2a55205a"
 
 DB_FILE = Path(__file__).resolve().with_name("agentic_mints.db")
 AUTO_MINT_THRESHOLD = 4
+WALLET_NOT_CONNECTED_ERROR = "Binance Agentic Wallet is not connected."
 
 w3_http = AsyncWeb3(AsyncHTTPProvider(BSC_HTTP_URL))
 
@@ -127,7 +128,8 @@ def topic_to_rpc_hex(topic: HexBytes) -> str:
 # LOCAL SQLITE DATABASE ENGINE (SOLE STORAGE)
 # ==========================================
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=15.0)
+    conn.execute("BEGIN IMMEDIATE")
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS notified_contracts (
@@ -149,10 +151,16 @@ def init_db():
             tx_hash TEXT,
             order_id TEXT,
             error_log TEXT,
+            scarcity_source_override INTEGER NOT NULL DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             executed_at TIMESTAMP
         )
     """)
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(mints)").fetchall()}
+    if "scarcity_source_override" not in columns:
+        cursor.execute(
+            "ALTER TABLE mints ADD COLUMN scarcity_source_override INTEGER NOT NULL DEFAULT 0"
+        )
     conn.commit()
     conn.close()
 
@@ -200,8 +208,46 @@ def save_local_record(address: str, nft_standard: str, function_name: str, tx_ha
         logging.error(f"SQLite write error for {address}: {e}")
 
 
-def queue_auto_mint(address: str, function_name: str, quality_score: int):
-    if quality_score < AUTO_MINT_THRESHOLD:
+def is_auto_mint_eligible(quality_report: dict) -> bool:
+    passed_count = quality_report["passed_count"]
+    return passed_count >= AUTO_MINT_THRESHOLD or (
+        passed_count == AUTO_MINT_THRESHOLD - 1
+        and quality_report["source_verified"]
+        and quality_report["supply_scarce"]
+    )
+
+
+def auto_mint_waiting_for_wallet_login(address: str, function_name: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        row = conn.execute(
+            """
+            SELECT status, error_log
+            FROM mints
+            WHERE contract_address = ? AND function_name = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (address.lower(), function_name),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return bool(
+        row
+        and row[0] in {"pending", "blocked"}
+        and row[1] == WALLET_NOT_CONNECTED_ERROR
+    )
+
+
+def queue_auto_mint(address: str, function_name: str, quality_report: dict):
+    quality_score = quality_report["passed_count"]
+    scarcity_source_override = (
+        quality_score == AUTO_MINT_THRESHOLD - 1
+        and quality_report["source_verified"]
+        and quality_report["supply_scarce"]
+    )
+    if not is_auto_mint_eligible(quality_report):
         return
 
     conn = None
@@ -216,15 +262,18 @@ def queue_auto_mint(address: str, function_name: str, quality_score: int):
 
         conn.execute(
             """
-            INSERT INTO mints (contract_address, function_name, quality_score)
-            VALUES (?, ?, ?)
+            INSERT INTO mints (
+                contract_address, function_name, quality_score, scarcity_source_override
+            )
+            VALUES (?, ?, ?, ?)
             """,
-            (address.lower(), function_name, quality_score)
+            (address.lower(), function_name, quality_score, scarcity_source_override)
         )
         conn.commit()
         logging.info(
             f"Queued contract {address} for reviewed mint execution "
-            f"(quality {quality_score}/7)."
+            f"(quality {quality_score}/7, scarce verified-source exception: "
+            f"{scarcity_source_override})."
         )
     except sqlite3.Error as e:
         logging.error(f"Failed to queue mint for {address}: {e}")
@@ -333,6 +382,8 @@ async def run_quality_checks(
     checksum_target = w3_http.to_checksum_address(contract_address)
     passed_count = 0
     results = {}
+    source_verified = False
+    supply_scarce = False
 
     # CHECK 1: Stricter On-Chain Mint Velocity & Unique Minters
     try:
@@ -387,6 +438,7 @@ async def run_quality_checks(
             source_data = res.json().get("result", [{}])[0]
             if source_data.get("SourceCode"):
                 results["3_source"] = "✅ Verified Source Code"
+                source_verified = True
                 passed_count += 1
             else:
                 results["3_source"] = "❌ Unverified Source Code"
@@ -437,6 +489,7 @@ async def run_quality_checks(
                 
         if max_supply and 0 < max_supply <= 5555:
             results["6_supply"] = f"✅ Scarce Supply ({max_supply} max)"
+            supply_scarce = True
             passed_count += 1
         elif max_supply:
             results["6_supply"] = f"⚠️ High/Unlimited Supply ({max_supply})"
@@ -464,6 +517,8 @@ async def run_quality_checks(
     return {
         "score_str": f"{passed_count}/7 Passed",
         "passed_count": passed_count,
+        "source_verified": source_verified,
+        "supply_scarce": supply_scarce,
         "details": results
     }
 
@@ -579,12 +634,13 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
 
             # Passed 1 hour without being minted -> Run quality checks again
             quality_report = await run_quality_checks(http_client, addr, tx_hash)
-            
-            # Update last notified timestamp locally to reset the 1-hour timer
-            save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
 
-            if quality_report["passed_count"] >= AUTO_MINT_THRESHOLD:
-                queue_auto_mint(addr, record["function_name"], quality_report["passed_count"])
+            if (
+                is_auto_mint_eligible(quality_report)
+                and auto_mint_waiting_for_wallet_login(addr, record["function_name"])
+            ):
+                queue_auto_mint(addr, record["function_name"], quality_report)
+                save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
                 await send_telegram_alert(
                     http_client,
                     contract=addr,
@@ -595,7 +651,12 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
                     is_reminder=True
                 )
             else:
-                logging.info(f"Skipped 1-hour reminder for {addr}: Quality score dropped ({quality_report['score_str']})")
+                logging.info(
+                    "Skipped 1-hour reminder for %s: automint is not waiting only on wallet sign-in "
+                    "or quality requirements are no longer met (%s).",
+                    addr,
+                    quality_report["score_str"],
+                )
             return
 
         # Run Full Inspection Pipeline
@@ -616,7 +677,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         quality_report = await run_quality_checks(http_client, addr, tx_hash)
 
         save_local_record(addr, nft_standard, func_name, tx_hash, minted=False)
-        queue_auto_mint(addr, func_name, quality_report["passed_count"])
+        queue_auto_mint(addr, func_name, quality_report)
         
         # Notify for ALL valid initial NFT detections with score included
         await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)

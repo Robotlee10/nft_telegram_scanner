@@ -35,7 +35,8 @@ BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-dataseed1.binance.org/")
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentic_mints.db")
 BSC_CHAIN_ID = 56
-AUTO_MINT_THRESHOLD = 4  # Threshold set to 4 checks
+AUTO_MINT_THRESHOLD = 4
+WALLET_NOT_CONNECTED_ERROR = "Binance Agentic Wallet is not connected."
 RPC_RECEIPT_TIMEOUT = 36  # Seconds to poll for transaction receipt
 RPC_POLL_INTERVAL = 2  # Seconds between receipt checks
 BAW_PACKAGE_ENTRY = os.path.join(
@@ -68,6 +69,7 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
 w3 = Web3(Web3.HTTPProvider(BSC_HTTP_URL))
 wallet_ready = asyncio.Event()
+wallet_login_required = asyncio.Event()
 
 # Keep strong references to fire-and-forget tasks so they aren't garbage collected
 _background_tasks: set = set()
@@ -87,6 +89,7 @@ def init_db():
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS mints (
@@ -98,6 +101,7 @@ def init_db():
                 tx_hash TEXT,
                 order_id TEXT,
                 error_log TEXT,
+                scarcity_source_override INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 executed_at TIMESTAMP
             )
@@ -107,6 +111,10 @@ def init_db():
         }
         if "order_id" not in columns:
             cursor.execute("ALTER TABLE mints ADD COLUMN order_id TEXT")
+        if "scarcity_source_override" not in columns:
+            cursor.execute(
+                "ALTER TABLE mints ADD COLUMN scarcity_source_override INTEGER NOT NULL DEFAULT 0"
+            )
         conn.commit()
         conn.close()
         logger.info(f"Database initialized successfully ({DB_FILE}).")
@@ -118,6 +126,26 @@ def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=15.0)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def clear_wallet_login_markers():
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            """
+            UPDATE mints
+            SET error_log = NULL
+            WHERE status = 'pending' AND error_log = ?
+            """,
+            (WALLET_NOT_CONNECTED_ERROR,),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Failed to clear stale wallet sign-in markers: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # ==========================================
@@ -265,6 +293,9 @@ def generate_qr_bytes(url: str) -> bytes:
 async def ensure_wallet_connected():
     status = await run_baw(["wallet", "status", "--json"])
     if status.get("status") != "CONNECTED":
+        if not MY_AGENTIC_WALLET:
+            raise WalletCLIError("MY_AGENTIC_WALLET is not configured in .env.")
+        wallet_login_required.set()
         signin = await run_baw(["auth", "signin", "--json"])
         if signin.get("status") != "ALREADY_CONNECTED":
             qr_url = signin.get("urlForWeb")
@@ -301,6 +332,11 @@ async def ensure_wallet_connected():
         status = await run_baw(["wallet", "status", "--json"])
         if status.get("status") != "CONNECTED":
             raise WalletCLIError("Wallet sign-in did not reach CONNECTED status.")
+        wallet_login_required.clear()
+    else:
+        wallet_login_required.clear()
+
+    clear_wallet_login_markers()
 
     if not MY_AGENTIC_WALLET:
         raise WalletCLIError("MY_AGENTIC_WALLET is not configured in .env.")
@@ -331,7 +367,7 @@ async def execute_agentic_mint(
     if not calldata:
         return "failed", f"Unsupported mint function: {function_name}"
     if not wallet_ready.is_set():
-        return "blocked", "Binance Agentic Wallet is not connected."
+        return "blocked", WALLET_NOT_CONNECTED_ERROR
     if not Web3.is_address(contract_address):
         return "failed", "Invalid contract address."
 
@@ -424,9 +460,38 @@ async def verify_tx_on_chain(tx_hash: str) -> Tuple[bool, Optional[int], str]:
 # AUTO-MINT ENGINE & TELEGRAM POLLER
 # ==========================================
 async def poll_db_auto_mints():
-    logger.info(f"Reviewed Mint Queue active. Monitoring DB for quality score >= {AUTO_MINT_THRESHOLD}/7...")
+    logger.info(
+        "Reviewed Mint Queue active. Monitoring threshold-qualified and scarce verified-source NFTs..."
+    )
     while True:
         if not wallet_ready.is_set():
+            conn = None
+            try:
+                if wallet_login_required.is_set():
+                    conn = get_db_connection()
+                    conn.execute(
+                        """
+                        UPDATE mints
+                        SET error_log = ?
+                        WHERE status = 'pending'
+                          AND error_log IS NULL
+                          AND (
+                              quality_score >= ?
+                              OR (quality_score = ? AND scarcity_source_override = 1)
+                          )
+                        """,
+                        (
+                            WALLET_NOT_CONNECTED_ERROR,
+                            AUTO_MINT_THRESHOLD,
+                            AUTO_MINT_THRESHOLD - 1,
+                        ),
+                    )
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"Failed to record wallet sign-in requirement for queued mints: {e}")
+            finally:
+                if conn is not None:
+                    conn.close()
             await asyncio.sleep(3)
             continue
 
@@ -437,9 +502,13 @@ async def poll_db_auto_mints():
             cursor.execute("""
                 SELECT id, contract_address, function_name, quality_score
                 FROM mints
-                WHERE status = 'pending' AND quality_score >= ?
+                WHERE status = 'pending'
+                  AND (
+                      quality_score >= ?
+                      OR (quality_score = ? AND scarcity_source_override = 1)
+                  )
                 ORDER BY id ASC LIMIT 5
-            """, (AUTO_MINT_THRESHOLD,))
+            """, (AUTO_MINT_THRESHOLD, AUTO_MINT_THRESHOLD - 1))
             rows = cursor.fetchall()
 
             for row in rows:
@@ -448,7 +517,10 @@ async def poll_db_auto_mints():
                 func_name = row["function_name"]
                 score = row["quality_score"]
                 logger.info(f"Auto-minting Target ID #{mint_id} (Score: {score}/7)")
-                cursor.execute("UPDATE mints SET status = 'processing' WHERE id = ?", (mint_id,))
+                cursor.execute(
+                    "UPDATE mints SET status = 'processing', error_log = NULL WHERE id = ?",
+                    (mint_id,),
+                )
                 conn.commit()
 
                 status, result = await execute_agentic_mint(
@@ -539,6 +611,7 @@ async def poll_telegram_updates():
 async def main():
     logger.info("Starting Binance Agentic Wallet mint review worker.")
     init_db()
+    clear_wallet_login_markers()
 
     async def connect_wallet():
         while not wallet_ready.is_set():

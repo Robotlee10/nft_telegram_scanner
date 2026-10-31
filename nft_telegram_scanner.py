@@ -240,7 +240,7 @@ def auto_mint_waiting_for_wallet_login(address: str, function_name: str) -> bool
     )
 
 
-def queue_auto_mint(address: str, function_name: str, quality_report: dict):
+def queue_auto_mint(address: str, function_name: str, quality_report: dict) -> str:
     quality_score = quality_report["passed_count"]
     scarcity_source_override = (
         quality_score == AUTO_MINT_THRESHOLD - 1
@@ -248,7 +248,7 @@ def queue_auto_mint(address: str, function_name: str, quality_report: dict):
         and quality_report["supply_scarce"]
     )
     if not is_auto_mint_eligible(quality_report):
-        return
+        return "not_eligible"
 
     conn = None
     try:
@@ -258,7 +258,7 @@ def queue_auto_mint(address: str, function_name: str, quality_report: dict):
             (address.lower(), function_name)
         ).fetchone()
         if existing:
-            return
+            return "already_exists"
 
         conn.execute(
             """
@@ -275,8 +275,10 @@ def queue_auto_mint(address: str, function_name: str, quality_report: dict):
             f"(quality {quality_score}/7, scarce verified-source exception: "
             f"{scarcity_source_override})."
         )
+        return "queued"
     except sqlite3.Error as e:
         logging.error(f"Failed to queue mint for {address}: {e}")
+        return "error"
     finally:
         if conn is not None:
             conn.close()
@@ -335,13 +337,13 @@ async def already_owns_nft(contract_address: str) -> bool:
         
     return False
 
-async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, str, str]:
+async def inspect_mint_access(contract_address: str) -> tuple[str | None, bool, str]:
     checksum_target = w3_http.to_checksum_address(contract_address)
     checksum_agentic = w3_http.to_checksum_address(MY_AGENTIC_WALLET)
     checksum_control = w3_http.to_checksum_address(CONTROL_WALLET_NO_ID)
+    public_function = None
 
     for fn in MINT_FUNCTIONS:
-        agentic_success_free = False
         try:
             tx_agentic: TxParams = {
                 "from": checksum_agentic,
@@ -350,14 +352,9 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
                 "data": HexBytes(fn["data"]),
             }
             await w3_http.eth.call(tx_agentic)
-            agentic_success_free = True
         except Exception:
-            agentic_success_free = False
-
-        if not agentic_success_free:
             continue
 
-        control_success = False
         try:
             tx_control: TxParams = {
                 "from": checksum_control,
@@ -366,18 +363,24 @@ async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, 
                 "data": HexBytes(fn["data"]),
             }
             await w3_http.eth.call(tx_control)
-            control_success = True
         except Exception:
-            control_success = False
+            return fn["name"], True, "Configured agent wallet passed; control-wallet simulation failed."
 
-        if agentic_success_free and not control_success:
-            return True, fn["name"], "EXCLUSIVE Agentic Free Mint Confirmed!"
+        if public_function is None:
+            public_function = fn["name"]
 
-    return False, "None", "Failed simulation or public mint."
+    if public_function:
+        return public_function, False, "Supported mint function is callable by the control wallet."
+    return None, False, "No supported mint function passed simulation."
+
+
+async def simulate_exclusive_agentic_mint(contract_address: str) -> tuple[bool, str, str]:
+    function_name, is_exclusive, reason = await inspect_mint_access(contract_address)
+    return is_exclusive, function_name if is_exclusive and function_name else "None", reason
 
 
 async def run_quality_checks(
-    http_client: httpx.AsyncClient, contract_address: str, tx_hash: str
+    http_client: httpx.AsyncClient, contract_address: str, tx_hash: str | None
 ) -> dict:
     checksum_target = w3_http.to_checksum_address(contract_address)
     passed_count = 0
@@ -500,6 +503,8 @@ async def run_quality_checks(
 
     # CHECK 7: Minter History
     try:
+        if not tx_hash:
+            raise ValueError("No triggering transaction was supplied.")
         transaction = await w3_http.eth.get_transaction(HexBytes(tx_hash))
         minter_address = transaction.get("from")
         if not minter_address:
@@ -525,8 +530,16 @@ async def run_quality_checks(
 # ==========================================
 # ALERT SENDER WITH MINT BUTTON SUPPORT
 # ==========================================
-async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft_standard: str, func_name: str, tx_hash: str, quality_report: dict, is_reminder: bool = False):
-    agent_command = f"Access my Binance Agentic Wallet. Call the write function {func_name} on BNB Chain at contract address {contract} with value 0 BNB. execute it, if it preview clearly and would return a ERC-721 token"
+async def send_telegram_alert(
+    http_client: httpx.AsyncClient,
+    contract: str,
+    nft_standard: str,
+    func_name: str,
+    tx_hash: str,
+    quality_report: dict,
+    is_reminder: bool = False,
+    manual_mint_available: bool = True,
+):
 
     details = quality_report["details"]
     quality_score = quality_report["score_str"]
@@ -538,7 +551,7 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         f"{header_title}\n\n"
         f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
         f"🎨 <b>NFT Standard:</b> ✅ {nft_standard}\n"
-        f"🛡️ <b>Access Gate:</b> 🔒 Agentic ID Holders Only\n"
+        f"🛡️ <b>Access Gate:</b> 🔒 Configured agent wallet only (control-wallet simulation failed)\n"
         f"⚙️ <b>Function:</b> <code>{func_name}</code>\n\n"
         f"📊 <b>Quality Score:</b> <b>{quality_score}</b>\n"
         f"1️⃣ <b>On-Chain Activity:</b> {details.get('1_activity')}\n"
@@ -549,17 +562,16 @@ async def send_telegram_alert(http_client: httpx.AsyncClient, contract: str, nft
         f"6️⃣ <b>Supply Scarcity:</b> {details.get('6_supply')}\n"
         f"7️⃣ <b>Minter Profile:</b> {details.get('7_minter')}\n\n"
         f"🔗 <b>BscScan:</b> https://bscscan.com/address/{contract}\n"
-        f"⚡ <b>Detected TX:</b> https://bscscan.com/tx/{tx_hash}\n\n"
-        f"🤖 <b>Direct Agent Command:</b>\n"
-        f"<pre><code>{agent_command}</code></pre>"
+        f"⚡ <b>Detected TX:</b> https://bscscan.com/tx/{tx_hash}"
     )
 
-    # Attach Mint button for all notifications (especially helpful for NFTs passing < 4 checks)
-    reply_markup = {
-        "inline_keyboard": [[
-            {"text": f"🪙 Mint Now ({passed_count}/7 Checks)", "callback_data": f"mint:{contract}:{func_name}"}
-        ]]
-    }
+    reply_markup = None
+    if manual_mint_available:
+        reply_markup = {
+            "inline_keyboard": [[
+                {"text": f"🪙 Mint Manually ({passed_count}/7 Checks)", "callback_data": f"mint:{contract}:{func_name}"}
+            ]]
+        }
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -639,7 +651,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
                 is_auto_mint_eligible(quality_report)
                 and auto_mint_waiting_for_wallet_login(addr, record["function_name"])
             ):
-                queue_auto_mint(addr, record["function_name"], quality_report)
+                queue_status = queue_auto_mint(addr, record["function_name"], quality_report)
                 save_local_record(addr, record["nft_standard"], record["function_name"], tx_hash, minted=False)
                 await send_telegram_alert(
                     http_client,
@@ -648,7 +660,8 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
                     func_name=record["function_name"],
                     tx_hash=tx_hash,
                     quality_report=quality_report,
-                    is_reminder=True
+                    is_reminder=True,
+                    manual_mint_available=queue_status not in {"queued", "already_exists"},
                 )
             else:
                 logging.info(
@@ -677,10 +690,19 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
         quality_report = await run_quality_checks(http_client, addr, tx_hash)
 
         save_local_record(addr, nft_standard, func_name, tx_hash, minted=False)
-        queue_auto_mint(addr, func_name, quality_report)
+        queue_status = queue_auto_mint(addr, func_name, quality_report)
         
         # Notify for ALL valid initial NFT detections with score included
-        await send_telegram_alert(http_client, addr, nft_standard, func_name, tx_hash, quality_report, is_reminder=False)
+        await send_telegram_alert(
+            http_client,
+            addr,
+            nft_standard,
+            func_name,
+            tx_hash,
+            quality_report,
+            is_reminder=False,
+            manual_mint_available=queue_status not in {"queued", "already_exists"},
+        )
         logging.info("Detected eligible %s NFT %s; Telegram alert attempted.", nft_standard, addr)
 
     except Exception:

@@ -22,8 +22,9 @@ import qrcode
 from hexbytes import HexBytes
 from web3 import Web3
 from dotenv import load_dotenv
+import nft_telegram_scanner as nft_scanner
 from nft_chain_monitor import NftChainMonitor
-from telegram_nft_features import TelegramNftFeatures
+from telegram_nft_features import TelegramNftFeatures, developer_mode_is_active
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -378,6 +379,25 @@ async def execute_agentic_mint(
         return "blocked", "MY_AGENTIC_WALLET is not configured in .env."
 
     try:
+        settings = await run_baw(["wallet", "settings", "--json"])
+        if not developer_mode_is_active(settings):
+            error = (
+                "Developer Mode is off or expired. Enable it in the Binance App "
+                "(Agentic Wallet → Settings → Developer Mode); no mint was executed."
+            )
+            await telegram_service.send_message(
+                f"❌ <b>Mint paused ({trigger_source}):</b> {error}",
+                reply_markup={
+                    "inline_keyboard": [[
+                        {
+                            "text": "🪙 Retry mint",
+                            "callback_data": f"mint:{contract_address}:{function_name}",
+                        }
+                    ]]
+                },
+            )
+            return "blocked", error
+
         # 1. Preview the contract call to guarantee it is valid and safe
         preview = await run_baw([
             "contract-call", "preview",
@@ -389,8 +409,21 @@ async def execute_agentic_mint(
             "--json",
         ])
         request_id = preview.get("requestId")
-        if not isinstance(request_id, str) or not request_id:
-            return "failed", "Preview did not return a valid request ID."
+        simulation = preview.get("simulationResult")
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or not isinstance(preview.get("parsedTx"), dict)
+            or not isinstance(simulation, dict)
+            or simulation.get("simulationErrorDetail")
+            or simulation.get("simulationCode") not in {"000000000", "0", 0}
+        ):
+            error = "Preview did not clearly confirm a successful simulation; nothing was executed."
+            await telegram_service.send_message(
+                f"❌ <b>Mint preview rejected ({trigger_source}).</b>\n"
+                f"<b>Contract:</b> <code>{contract_address}</code>\n{error}"
+            )
+            return "failed", error
 
         logger.info(f"Preview passed for {contract_address}. Executing autonomously...")
 
@@ -458,6 +491,54 @@ async def verify_tx_on_chain(tx_hash: str) -> Tuple[bool, Optional[int], str]:
     return False, None, f"Receipt Timeout ({RPC_RECEIPT_TIMEOUT}s expired)"
 
 
+async def scan_telegram_contract(contract_address: str) -> dict:
+    is_nft, nft_standard = await nft_scanner.verify_is_nft_contract(contract_address)
+    if not is_nft:
+        return {"is_nft": False}
+
+    already_owned = await nft_scanner.already_owns_nft(contract_address)
+    function_name, is_exclusive, access_reason = await nft_scanner.inspect_mint_access(
+        contract_address
+    )
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        quality_report = await nft_scanner.run_quality_checks(
+            client,
+            contract_address,
+            tx_hash=None,
+        )
+
+    auto_mint_eligible = bool(
+        not already_owned
+        and is_exclusive
+        and function_name
+        and nft_scanner.is_auto_mint_eligible(quality_report)
+    )
+    queue_status = (
+        nft_scanner.queue_auto_mint(contract_address, function_name, quality_report)
+        if auto_mint_eligible and function_name
+        else None
+    )
+
+    if is_exclusive:
+        access_gate = f"Configured agent wallet only ({access_reason})"
+    elif function_name:
+        access_gate = f"Public mint ({access_reason})"
+    else:
+        access_gate = f"Not confirmed ({access_reason})"
+
+    return {
+        "is_nft": True,
+        "nft_standard": nft_standard,
+        "already_owned": already_owned,
+        "access_gate": access_gate,
+        "function_name": function_name,
+        "quality_report": quality_report,
+        "auto_mint_threshold": nft_scanner.AUTO_MINT_THRESHOLD,
+        "auto_mint_eligible": auto_mint_eligible,
+        "queue_status": queue_status,
+    }
+
+
 telegram_nft_features = TelegramNftFeatures(
     telegram_service=telegram_service,
     run_baw=run_baw,
@@ -467,6 +548,7 @@ telegram_nft_features = TelegramNftFeatures(
     mint_calldata=MINT_CALLDATA,
     verify_transaction=verify_tx_on_chain,
     chat_id=TELEGRAM_CHAT_ID,
+    scan_contract=scan_telegram_contract,
     chain_id=BSC_CHAIN_ID,
 )
 
@@ -597,15 +679,7 @@ async def poll_telegram_updates():
                         cq = update["callback_query"]
                         cq_id, cb_data = cq["id"], cq.get("data", "")
 
-                        if cb_data.startswith("mint:"):
-                            parts = cb_data.split(":")
-                            if len(parts) >= 3:
-                                await telegram_service.answer_callback(cq_id, "⚡ Running Autonomous Mint...")
-                                spawn(
-                                    execute_agentic_mint(parts[1], parts[2], trigger_source="MANUAL TAP (Autonomous)")
-                                )
-
-                        elif cb_data.startswith("direct:"):
+                        if cb_data.startswith("mint:") or cb_data.startswith("direct:"):
                             await telegram_nft_features.handle_callback(cq)
 
                         elif cb_data.startswith("auth:regen"):

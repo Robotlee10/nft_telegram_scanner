@@ -22,6 +22,7 @@ import qrcode
 from hexbytes import HexBytes
 from web3 import Web3
 from dotenv import load_dotenv
+from nft_chain_monitor import NftChainMonitor
 from telegram_nft_features import TelegramNftFeatures
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -469,6 +470,17 @@ telegram_nft_features = TelegramNftFeatures(
     chain_id=BSC_CHAIN_ID,
 )
 
+nft_chain_monitor = (
+    NftChainMonitor(
+        web3=w3,
+        wallet_address=MY_AGENTIC_WALLET,
+        database_path=DB_FILE,
+        telegram_service=telegram_service,
+    )
+    if MY_AGENTIC_WALLET and Web3.is_address(MY_AGENTIC_WALLET)
+    else None
+)
+
 
 # ==========================================
 # AUTO-MINT ENGINE & TELEGRAM POLLER
@@ -643,6 +655,10 @@ async def main():
 
     spawn(connect_wallet())
     spawn(poll_db_auto_mints())
+    if nft_chain_monitor is not None:
+        spawn(nft_chain_monitor.run())
+    else:
+        logger.error("On-chain NFT monitor is disabled: MY_AGENTIC_WALLET is not a valid address.")
     await poll_telegram_updates()
 
 

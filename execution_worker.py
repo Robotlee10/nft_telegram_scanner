@@ -22,6 +22,7 @@ import qrcode
 from hexbytes import HexBytes
 from web3 import Web3
 from dotenv import load_dotenv
+from telegram_nft_features import TelegramNftFeatures
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -456,6 +457,19 @@ async def verify_tx_on_chain(tx_hash: str) -> Tuple[bool, Optional[int], str]:
     return False, None, f"Receipt Timeout ({RPC_RECEIPT_TIMEOUT}s expired)"
 
 
+telegram_nft_features = TelegramNftFeatures(
+    telegram_service=telegram_service,
+    run_baw=run_baw,
+    wallet_ready=wallet_ready,
+    wallet_address=MY_AGENTIC_WALLET,
+    web3=w3,
+    mint_calldata=MINT_CALLDATA,
+    verify_transaction=verify_tx_on_chain,
+    chat_id=TELEGRAM_CHAT_ID,
+    chain_id=BSC_CHAIN_ID,
+)
+
+
 # ==========================================
 # AUTO-MINT ENGINE & TELEGRAM POLLER
 # ==========================================
@@ -567,42 +581,46 @@ async def poll_telegram_updates():
                     continue
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
-                    if "callback_query" not in update:
-                        continue
-                    cq = update["callback_query"]
-                    cq_id, cb_data = cq["id"], cq.get("data", "")
+                    if "callback_query" in update:
+                        cq = update["callback_query"]
+                        cq_id, cb_data = cq["id"], cq.get("data", "")
 
-                    if cb_data.startswith("mint:"):
-                        parts = cb_data.split(":")
-                        if len(parts) >= 3:
-                            await telegram_service.answer_callback(cq_id, "⚡ Running Autonomous Mint...")
-                            spawn(
-                                execute_agentic_mint(parts[1], parts[2], trigger_source="MANUAL TAP (Autonomous)")
-                            )
-
-                    elif cb_data.startswith("auth:regen"):
-                        await telegram_service.answer_callback(cq_id, "🔄 Generating fresh QR code...")
-                        try:
-                            signin = await run_baw(["auth", "signin", "--json"])
-                            qr_url = signin.get("urlForWeb")
-                            qr_code_id = signin.get("qrCodeId")
-                            pairing_code = signin.get("pairingCode")
-                            if qr_url:
-                                qr_bytes = generate_qr_bytes(qr_url)
-                                markup = {
-                                    "inline_keyboard": [[
-                                        {"text": "🔄 Regenerate QR Code", "callback_data": f"auth:regen:{qr_code_id}"}
-                                    ]]
-                                }
-                                caption = (
-                                    f"🔐 <b>Regenerated Binance Sign-In QR Code</b>\n\n"
-                                    f"🔗 <b>Sign-In Link:</b> <a href='{qr_url}'>{qr_url}</a>\n\n"
-                                    f"🔢 <b>Pairing Code:</b> <code>{pairing_code}</code>\n"
-                                    f"⏱️ <i>Expires in 5 minutes. Tap below to regenerate if needed.</i>"
+                        if cb_data.startswith("mint:"):
+                            parts = cb_data.split(":")
+                            if len(parts) >= 3:
+                                await telegram_service.answer_callback(cq_id, "⚡ Running Autonomous Mint...")
+                                spawn(
+                                    execute_agentic_mint(parts[1], parts[2], trigger_source="MANUAL TAP (Autonomous)")
                                 )
-                                await telegram_service.send_photo(qr_bytes, caption, reply_markup=markup)
-                        except Exception as ex:
-                            logger.error(f"Failed to regenerate QR code: {ex}")
+
+                        elif cb_data.startswith("direct:"):
+                            await telegram_nft_features.handle_callback(cq)
+
+                        elif cb_data.startswith("auth:regen"):
+                            await telegram_service.answer_callback(cq_id, "🔄 Generating fresh QR code...")
+                            try:
+                                signin = await run_baw(["auth", "signin", "--json"])
+                                qr_url = signin.get("urlForWeb")
+                                qr_code_id = signin.get("qrCodeId")
+                                pairing_code = signin.get("pairingCode")
+                                if qr_url:
+                                    qr_bytes = generate_qr_bytes(qr_url)
+                                    markup = {
+                                        "inline_keyboard": [[
+                                            {"text": "🔄 Regenerate QR Code", "callback_data": f"auth:regen:{qr_code_id}"}
+                                        ]]
+                                    }
+                                    caption = (
+                                        f"🔐 <b>Regenerated Binance Sign-In QR Code</b>\n\n"
+                                        f"🔗 <b>Sign-In Link:</b> <a href='{qr_url}'>{qr_url}</a>\n\n"
+                                        f"🔢 <b>Pairing Code:</b> <code>{pairing_code}</code>\n"
+                                        f"⏱️ <i>Expires in 5 minutes. Tap below to regenerate if needed.</i>"
+                                    )
+                                    await telegram_service.send_photo(qr_bytes, caption, reply_markup=markup)
+                            except Exception as ex:
+                                logger.error(f"Failed to regenerate QR code: {ex}")
+                    elif "message" in update:
+                        await telegram_nft_features.handle_message(update["message"])
         except Exception as e:
             logger.error(f"Error in Telegram Polling: {e}")
             await asyncio.sleep(5)

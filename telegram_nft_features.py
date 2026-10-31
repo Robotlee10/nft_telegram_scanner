@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
@@ -25,6 +26,39 @@ DIRECT_COMMAND_PATTERN = re.compile(
 
 ERC721_INTERFACE_ID = bytes.fromhex("80ac58cd")
 logger = logging.getLogger(__name__)
+
+
+def developer_mode_is_active(settings: dict, now: float | None = None) -> bool:
+    dev_mode = settings.get("devMode")
+    if not isinstance(dev_mode, dict) or dev_mode.get("enabled") is not True:
+        return False
+
+    expires_at = dev_mode.get("expiresAt")
+    if expires_at is None:
+        return True
+
+    expiration_timestamp = None
+    if isinstance(expires_at, (int, float)):
+        expiration_timestamp = float(expires_at)
+    elif isinstance(expires_at, str):
+        try:
+            expiration_timestamp = float(expires_at)
+        except ValueError:
+            try:
+                expiration = datetime.fromisoformat(
+                    expires_at.replace("Z", "+00:00")
+                )
+                if expiration.tzinfo is None:
+                    expiration = expiration.replace(tzinfo=timezone.utc)
+                expiration_timestamp = expiration.timestamp()
+            except ValueError:
+                return True
+    else:
+        return True
+
+    if expiration_timestamp > 10**12:
+        expiration_timestamp /= 1000
+    return expiration_timestamp > (time.time() if now is None else now)
 
 
 @dataclass(frozen=True)
@@ -110,14 +144,7 @@ class TelegramNftFeatures:
             )
             return True
 
-        dev_mode = settings.get("devMode")
-        expires_at = dev_mode.get("expiresAt") if isinstance(dev_mode, dict) else None
-        if (
-            not isinstance(dev_mode, dict)
-            or dev_mode.get("enabled") is not True
-            or not isinstance(expires_at, (int, float))
-            or expires_at <= time.time()
-        ):
+        if not developer_mode_is_active(settings):
             await self.telegram_service.send_message(
                 "❌ Developer Mode is off or expired. Enable it in the Binance App "
                 "(Agentic Wallet → Settings → Developer Mode), then resend the command."
@@ -288,14 +315,7 @@ class TelegramNftFeatures:
 
         try:
             settings = await self.run_baw(["wallet", "settings", "--json"])
-            dev_mode = settings.get("devMode")
-            expires_at = dev_mode.get("expiresAt") if isinstance(dev_mode, dict) else None
-            if (
-                not isinstance(dev_mode, dict)
-                or dev_mode.get("enabled") is not True
-                or not isinstance(expires_at, (int, float))
-                or expires_at <= time.time()
-            ):
+            if not developer_mode_is_active(settings):
                 await self.telegram_service.answer_callback(
                     callback_query["id"], "Developer Mode is off or expired."
                 )

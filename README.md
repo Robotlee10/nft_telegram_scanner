@@ -95,6 +95,9 @@ BSC_HISTORY_API_KEY=your-etherscan-api-key
 # Optional: used as the comparison wallet for the exclusive mint access test.
 CONTROL_WALLET_NO_ID=0x0000000000000000000000000000000000000001
 
+# Minimum score required to auto-mint (0-7; defaults to 6).
+AUTO_MINT_THRESHOLD=6
+
 # Mint cost policy. Defaults to free mints only.
 FREE_MINT_ONLY=true
 # Used only when FREE_MINT_ONLY=false; direct/manual mint commands are capped.
@@ -169,19 +172,29 @@ control wallet are not treated as proof of exclusivity.
   absence is reported as unknown, not as evidence that the contract is safe.
 - Proxy inspection checks EIP-1967 implementation/admin/beacon slots and
   EIP-1167 minimal proxies, including implementation/admin/beacon addresses when
-  exposed. A detected proxy blocks automatic minting. Verified ABIs are scanned
-  for owner status and upgrade, pause, blacklist, metadata, sale, price, supply,
-  role, and royalty setters; recognized high-risk controls block automatic minting.
-  Custom proxy patterns and unverified source may not be detected, and source
-  verification does not establish trustworthiness.
+  exposed. A detected proxy and recognized high-risk controls fail their
+  respective scored checks. Verified ABIs are scanned for owner status and
+  upgrade, pause, blacklist, metadata, sale, price, supply, role, and royalty
+  setters. Custom proxy patterns and unverified source may not be detected, and
+  source verification does not establish trustworthiness.
 - Metadata JSON is fetched with a 6-second timeout and a 512 KiB limit.
   Redirects are rejected; external HTTPS hosts are rejected if DNS resolves to
   non-public IP addresses. The first referenced image/asset is checked using a
   1 KiB range request, with redirects and non-media content types rejected.
   Metadata is not executed, and the scanner does not evaluate artistic quality.
-- Recent activity, recipient diversity, ERC-2981 support, supply caps, and
-  minter nonce are reported only as informational signals. They do not raise
-  the 0-to-4 technical score or bypass a safety gate.
+- The quality score is out of seven: metadata, verified source, proxy safety,
+  admin controls, recent mint activity, recipient diversity, and supply/royalty
+  signals. Recent activity passes with at least one mint event in the last
+  1,000 blocks; diversity passes with at least two distinct recipient wallets;
+  supply/royalties passes with a declared cap of 5,555 or fewer or ERC-2981
+  support. Activity, diversity, and supply/royalty signals can be manipulated
+  and are not security guarantees.
+- `AUTO_MINT_THRESHOLD` sets the minimum score from 0 to 7 and defaults to 6.
+  Any combination of the seven scored checks can meet the threshold, including
+  when one or more core checks fail. Required ownership, access-gate,
+  live-condition, and cost checks remain mandatory regardless of the threshold.
+  Wallet-preview risk details or authority changes still block automatic
+  execution.
 - A confirmed transaction must emit an ERC-721 `Transfer` or ERC-1155 transfer
   event from the zero address to the configured wallet at the scanned contract.
   The verified transaction and token IDs are stored in the `verified_mints`

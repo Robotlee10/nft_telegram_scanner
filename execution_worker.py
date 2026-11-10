@@ -43,7 +43,6 @@ BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-dataseed1.binance.org/")
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentic_mints.db")
 BSC_CHAIN_ID = 56
-AUTO_MINT_THRESHOLD = 6
 WALLET_NOT_CONNECTED_ERROR = "Binance Agentic Wallet is not connected."
 RPC_RECEIPT_TIMEOUT = 36  # Seconds to poll for transaction receipt
 RPC_POLL_INTERVAL = 2  # Seconds between receipt checks
@@ -884,7 +883,7 @@ async def poll_db_auto_mints():
                         """,
                         (
                             WALLET_NOT_CONNECTED_ERROR,
-                            AUTO_MINT_THRESHOLD,
+                            nft_scanner.AUTO_MINT_THRESHOLD,
                         ),
                     )
                     conn.commit()
@@ -907,7 +906,7 @@ async def poll_db_auto_mints():
                   AND safety_approved = 1
                   AND quality_score >= ?
                 ORDER BY id ASC LIMIT 5
-            """, (AUTO_MINT_THRESHOLD,))
+            """, (nft_scanner.AUTO_MINT_THRESHOLD,))
             rows = cursor.fetchall()
 
             for row in rows:
@@ -916,10 +915,10 @@ async def poll_db_auto_mints():
                 func_name = row["function_name"]
                 score = row["quality_score"]
                 logger.info(
-                    "Auto-minting safety-approved queue record #%s (technical checks: %s/%s).",
+                    "Auto-minting safety-approved queue record #%s (quality checks: %s/%s).",
                     mint_id,
                     score,
-                    AUTO_MINT_THRESHOLD,
+                    nft_scanner.AUTO_MINT_THRESHOLD,
                 )
                 cursor.execute(
                     "UPDATE mints SET status = 'processing', error_log = NULL WHERE id = ?",

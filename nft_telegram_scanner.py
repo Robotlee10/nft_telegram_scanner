@@ -123,7 +123,13 @@ ERC1155_INTERFACE_ID = "0xd9b67a26"
 ERC2981_ROYALTY_INTERFACE_ID = "0x2a55205a"
 
 DB_FILE = Path(__file__).resolve().with_name("agentic_mints.db")
-AUTO_MINT_THRESHOLD = 6
+MAX_QUALITY_CHECKS = 7
+try:
+    AUTO_MINT_THRESHOLD = int(os.getenv("AUTO_MINT_THRESHOLD", "6"))
+except ValueError as error:
+    raise ValueError("AUTO_MINT_THRESHOLD must be an integer from 0 to 7.") from error
+if not 0 <= AUTO_MINT_THRESHOLD <= MAX_QUALITY_CHECKS:
+    raise ValueError("AUTO_MINT_THRESHOLD must be an integer from 0 to 7.")
 WALLET_NOT_CONNECTED_ERROR = "Binance Agentic Wallet is not connected."
 MAX_METADATA_BYTES = 512 * 1024
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -271,7 +277,7 @@ def is_auto_mint_eligible(quality_report: dict) -> bool:
     required_checks = quality_report.get("required_checks")
     return bool(
         quality_report.get("auto_mint_safe") is True
-        and quality_report.get("passed_count") == AUTO_MINT_THRESHOLD
+        and quality_report.get("passed_count", 0) >= AUTO_MINT_THRESHOLD
         and isinstance(required_checks, dict)
         and required_checks
         and all(value is True for value in required_checks.values())
@@ -298,7 +304,7 @@ def add_required_mint_checks(
         f"Required check failed or is unknown: {name}." for name in failed
     )
     quality_report["auto_mint_safe"] = (
-        quality_report.get("passed_count") == AUTO_MINT_THRESHOLD
+        quality_report.get("passed_count", 0) >= AUTO_MINT_THRESHOLD
         and all(required_checks.values())
     )
     return quality_report
@@ -361,7 +367,7 @@ def queue_auto_mint(address: str, function_name: str, quality_report: dict) -> s
         conn.commit()
         logging.info(
             "Queued contract %s for safety-approved mint execution "
-            "(technical checks %s/%s).",
+            "(quality checks %s/%s).",
             address,
             quality_score,
             AUTO_MINT_THRESHOLD,
@@ -1011,7 +1017,7 @@ async def run_quality_checks(
     core_checks = {}
     blockers = []
 
-    # Metadata quality is a technical check; external market activity is informational.
+    # Metadata is a core safety check; activity is scored but can be manipulated.
     try:
         metadata_ok, metadata_detail = await _inspect_metadata(http_client, checksum_target)
         results["1_metadata"] = f"{'✅' if metadata_ok else '❌'} {metadata_detail}"
@@ -1021,7 +1027,7 @@ async def run_quality_checks(
         results["1_metadata"] = f"❌ Metadata check error: {error}"
         core_checks["metadata"] = False
     if not core_checks["metadata"]:
-        blockers.append("Metadata did not pass safe JSON/asset validation.")
+        blockers.append("Scored check failed: metadata did not pass safe JSON/asset validation.")
 
     # Verified source enables ABI-based inspection; it is not itself a trust guarantee.
     source_data = None
@@ -1036,7 +1042,7 @@ async def run_quality_checks(
         results["2_source"] = "❌ Source verification unavailable or unverified."
     core_checks["source"] = source_verified
     if not source_verified:
-        blockers.append("Verified source and ABI are required for automatic minting.")
+        blockers.append("Scored check failed: verified source and ABI are unavailable.")
 
     risk = await _inspect_contract_risk(checksum_target, source_data)
     proxy_safe = risk["proxy"] is False
@@ -1063,18 +1069,18 @@ async def run_quality_checks(
     core_checks["proxy"] = proxy_safe
     core_checks["admin_controls"] = controls_safe
     if not proxy_safe:
-        blockers.append("Upgradeable proxy or unknown proxy status blocks automatic minting.")
+        blockers.append("Scored check failed: contract is upgradeable or proxy status is unknown.")
     if not controls_safe:
-        blockers.append("High-risk admin controls are exposed or could not be verified.")
+        blockers.append("Scored check failed: high-risk admin controls are exposed or unknown.")
 
-    passed_count = sum(core_checks.values())
-    results["5_activity"] = "ℹ️ Activity is informational and is not scored."
-    results["6_distribution"] = "ℹ️ Minter diversity can be manipulated and is not scored."
-    results["7_supply_and_royalties"] = (
-        "ℹ️ Supply caps and royalties are informational and are not scored."
-    )
+    activity_check = False
+    distribution_check = False
+    supply_or_royalties_check = False
+    results["5_activity"] = "⚠️ Recent activity check unavailable."
+    results["6_distribution"] = "⚠️ Minter diversity check unavailable."
+    results["7_supply_and_royalties"] = "⚠️ Supply and royalty checks unavailable."
 
-    # Activity and demand are advisory only; wash trading can spoof both signals.
+    # Activity and demand are scored signals, but wash trading can spoof them.
     try:
         latest_block = await w3_http.eth.block_number
         logs = await get_mint_logs(
@@ -1085,17 +1091,21 @@ async def run_quality_checks(
             recipient = get_mint_recipient(log)
             if recipient is not None:
                 unique_minters.add(recipient)
+        activity_check = len(logs) > 0
+        distribution_check = len(unique_minters) > 1
         results["5_activity"] = (
-            f"ℹ️ {len(logs)} recent mint events from {len(unique_minters)} recipient wallets "
-            "(not scored)."
+            f"{'✅' if activity_check else '❌'} {len(logs)} recent mint events "
+            f"from {len(unique_minters)} recipient wallets."
         )
         results["6_distribution"] = (
-            f"ℹ️ {len(unique_minters)} distinct recent recipients; this can be manipulated "
-            "and is not scored."
+            f"{'✅' if distribution_check else '❌'} {len(unique_minters)} "
+            "distinct recent recipient wallets; this can be manipulated."
         )
     except Exception as error:
         results["5_activity"] = f"ℹ️ Activity data unavailable: {error}"
+        results["6_distribution"] = f"ℹ️ Distribution data unavailable: {error}"
 
+    has_royalty = False
     try:
         contract_165 = w3_http.eth.contract(address=checksum_target, abi=ERC165_ABI)
         has_royalty = await contract_165.functions.supportsInterface(bytes.fromhex(ERC2981_ROYALTY_INTERFACE_ID[2:])).call()
@@ -1117,9 +1127,9 @@ async def run_quality_checks(
                 continue
         if max_supply is not None and 0 < max_supply <= 5555:
             supply_scarce = True
-            results["7_supply_and_royalties"] += f" Declared cap: {max_supply} (informational)."
+            results["7_supply_and_royalties"] += f" Declared cap: {max_supply}."
         elif max_supply is not None:
-            results["7_supply_and_royalties"] += f" Declared cap: {max_supply} (informational)."
+            results["7_supply_and_royalties"] += f" Declared cap: {max_supply}."
         else:
             results["7_supply_and_royalties"] += " Supply cap not exposed."
     except Exception as error:
@@ -1144,14 +1154,30 @@ async def run_quality_checks(
     except Exception as error:
         results["7_supply_and_royalties"] += f" Minter history unavailable: {error}"
 
+    supply_or_royalties_check = supply_scarce or has_royalty
+    results["7_supply_and_royalties"] = (
+        f"{'✅' if supply_or_royalties_check else '❌'} "
+        f"{results['7_supply_and_royalties']} "
+        "(passes with a declared supply cap of 5,555 or fewer, or ERC-2981 support)."
+    )
+    score_checks = {
+        **core_checks,
+        "recent_activity": activity_check,
+        "minter_diversity": distribution_check,
+        "supply_or_royalties": supply_or_royalties_check,
+    }
+    passed_count = sum(score_checks.values())
+
     return {
-        "score_str": f"{passed_count}/4 technical checks",
+        "score_str": f"{passed_count}/{MAX_QUALITY_CHECKS} checks",
         "passed_count": passed_count,
-        "score_max": AUTO_MINT_THRESHOLD,
+        "score_max": MAX_QUALITY_CHECKS,
+        "auto_mint_threshold": AUTO_MINT_THRESHOLD,
         "source_verified": source_verified,
         "supply_scarce": supply_scarce,
         "core_checks": core_checks,
-        "auto_mint_safe": passed_count == AUTO_MINT_THRESHOLD,
+        "score_checks": score_checks,
+        "auto_mint_safe": passed_count >= AUTO_MINT_THRESHOLD,
         "auto_mint_blockers": blockers,
         "details": results,
     }
@@ -1191,9 +1217,11 @@ async def send_telegram_alert(
         f"2️⃣ <b>Verified source:</b> {html.escape(str(details.get('2_source', 'Unknown')))}\n"
         f"3️⃣ <b>Proxy check:</b> {html.escape(str(details.get('3_proxy', 'Unknown')))}\n"
         f"4️⃣ <b>Admin controls:</b> {html.escape(str(details.get('4_admin_controls', 'Unknown')))}\n"
-        f"5️⃣ <b>Activity (informational):</b> {html.escape(str(details.get('5_activity', 'Unknown')))}\n"
-        f"6️⃣ <b>Distribution (informational):</b> {html.escape(str(details.get('6_distribution', 'Unknown')))}\n"
-        f"7️⃣ <b>Supply/royalties (informational):</b> {html.escape(str(details.get('7_supply_and_royalties', 'Unknown')))}\n"
+        f"5️⃣ <b>Recent activity:</b> {html.escape(str(details.get('5_activity', 'Unknown')))}\n"
+        f"6️⃣ <b>Minter diversity:</b> {html.escape(str(details.get('6_distribution', 'Unknown')))}\n"
+        f"7️⃣ <b>Supply/royalties:</b> {html.escape(str(details.get('7_supply_and_royalties', 'Unknown')))}\n"
+        f"🤖 <b>Auto-mint score threshold:</b> {AUTO_MINT_THRESHOLD}/{MAX_QUALITY_CHECKS} "
+        "(all required ownership, access-gate, live-condition, and cost checks must also pass)\n"
         f"💰 <b>Mint cost policy:</b> {html.escape(mint_cost_policy_description())}\n\n"
         f"🧪 <b>Live mint getters:</b> "
         f"<code>{html.escape(json.dumps(quality_report.get('mint_conditions', {}).get('values', {}), default=str))}</code>\n"
@@ -1202,7 +1230,7 @@ async def send_telegram_alert(
     )
     blockers = quality_report.get("auto_mint_blockers", [])
     if blockers:
-        message += "\n\n⛔ <b>Auto-mint blockers:</b>\n" + "\n".join(
+        message += "\n\n⚠️ <b>Failed auto-mint checks:</b>\n" + "\n".join(
             f"• {html.escape(str(blocker))}" for blocker in blockers
         )
 
@@ -1211,7 +1239,7 @@ async def send_telegram_alert(
         reply_markup = {
             "inline_keyboard": [[
                 {
-                    "text": f"🪙 Mint Manually ({passed_count}/4 technical checks)",
+                    "text": f"🪙 Mint Manually ({passed_count}/{MAX_QUALITY_CHECKS} checks)",
                     "callback_data": f"mint:{contract}:{func_name}",
                 }
             ]]

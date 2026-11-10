@@ -1217,47 +1217,44 @@ async def send_telegram_alert(
     func_name: str,
     tx_hash: str,
     quality_report: dict,
+    access_gate: str,
     is_reminder: bool = False,
     manual_mint_available: bool = True,
 ):
 
     details = quality_report["details"]
-    quality_score = quality_report["score_str"]
     passed_count = quality_report["passed_count"]
 
     header_title = (
         "⏰ <b>1-HOUR REMINDER: UNMINTED NFT</b> ⏰"
         if is_reminder
-        else "🚨 <b>EXCLUSIVE NFT MINT DETECTED</b> 🚨"
+        else "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨"
     )
 
     message = (
         f"{header_title}\n\n"
-        f"📄 <b>Contract Address:</b> <code>{contract}</code>\n"
-        f"🎨 <b>NFT Standard:</b> ✅ {nft_standard}\n"
-        f"🛡️ <b>Access Gate:</b> 🔒 Explicitly verified agent-wallet gate\n"
-        f"⚙️ <b>Function:</b> <code>{func_name}</code>\n\n"
-        f"📊 <b>Quality Score:</b> <b>{quality_score}</b>\n"
-        f"1️⃣ <b>Metadata:</b> {html.escape(str(details.get('1_metadata', 'Unknown')))}\n"
-        f"2️⃣ <b>Verified source:</b> {html.escape(str(details.get('2_source', 'Unknown')))}\n"
-        f"3️⃣ <b>Proxy check:</b> {html.escape(str(details.get('3_proxy', 'Unknown')))}\n"
-        f"4️⃣ <b>Admin controls:</b> {html.escape(str(details.get('4_admin_controls', 'Unknown')))}\n"
-        f"5️⃣ <b>Recent activity:</b> {html.escape(str(details.get('5_activity', 'Unknown')))}\n"
-        f"6️⃣ <b>Minter diversity:</b> {html.escape(str(details.get('6_distribution', 'Unknown')))}\n"
-        f"7️⃣ <b>Supply/royalties:</b> {html.escape(str(details.get('7_supply_and_royalties', 'Unknown')))}\n"
-        f"🤖 <b>Auto-mint score threshold:</b> {AUTO_MINT_THRESHOLD}/{MAX_QUALITY_CHECKS} "
-        "(all required ownership, access-gate, live-condition, and cost checks must also pass)\n"
-        f"💰 <b>Mint cost policy:</b> {html.escape(mint_cost_policy_description())}\n\n"
-        f"🧪 <b>Live mint getters:</b> "
-        f"<code>{html.escape(json.dumps(quality_report.get('mint_conditions', {}).get('values', {}), default=str))}</code>\n"
-        f"🔗 <b>BscScan:</b> https://bscscan.com/address/{contract}\n"
-        f"⚡ <b>Detected TX:</b> https://bscscan.com/tx/{tx_hash}"
+        f"📄 <b>Contract Address:</b> <code>{html.escape(contract)}</code>\n"
+        f"🎨 <b>NFT Standard:</b> ✅ {html.escape(nft_standard)}\n"
+        f"🛡️ <b>Access Gate:</b> 🔒 {html.escape(access_gate)}\n"
+        f"⚙️ <b>Function:</b> <code>{html.escape(func_name)}</code>\n\n"
+        f"📊 <b>Quality Score:</b> <b>{passed_count}/{MAX_QUALITY_CHECKS} Passed</b>\n"
+        f"1️⃣ <b>On-Chain Activity:</b> "
+        f"{html.escape(str(details.get('5_activity', 'Not checked')))}\n"
+        f"2️⃣ <b>Metadata Integrity:</b> "
+        f"{html.escape(str(details.get('1_metadata', 'Not checked')))}\n"
+        f"3️⃣ <b>Source Code:</b> "
+        f"{html.escape(str(details.get('2_source', 'Not checked')))}\n"
+        f"4️⃣ <b>Minter Diversity:</b> "
+        f"{html.escape(str(details.get('6_distribution', 'Not checked')))}\n"
+        f"5️⃣ <b>Proxy Safety:</b> "
+        f"{html.escape(str(details.get('3_proxy', 'Not checked')))}\n"
+        f"6️⃣ <b>Admin Controls:</b> "
+        f"{html.escape(str(details.get('4_admin_controls', 'Not checked')))}\n"
+        f"7️⃣ <b>Supply/Royalties:</b> "
+        f"{html.escape(str(details.get('7_supply_and_royalties', 'Not checked')))}\n\n"
+        f"🔗 <b>BscScan:</b> https://bscscan.com/address/{html.escape(contract)}\n"
+        f"⚡️ <b>Detected TX:</b> https://bscscan.com/tx/{html.escape(tx_hash)}"
     )
-    blockers = quality_report.get("auto_mint_blockers", [])
-    if blockers:
-        message += "\n\n⚠️ <b>Failed auto-mint checks:</b>\n" + "\n".join(
-            f"• {html.escape(str(blocker))}" for blocker in blockers
-        )
 
     reply_markup = None
     if manual_mint_available:
@@ -1279,27 +1276,48 @@ async def send_telegram_alert(
     }
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        res = await http_client.post(url, json=payload, timeout=10.0)
+    for attempt in range(3):
         try:
-            response_data = res.json()
-        except ValueError:
-            logging.error(
-                "Telegram sendMessage returned HTTP %s with a non-JSON response: %s",
-                res.status_code,
-                res.text[:300],
+            res = await http_client.post(url, json=payload, timeout=10.0)
+            try:
+                response_data = res.json()
+            except ValueError:
+                logging.error(
+                    "Telegram sendMessage returned HTTP %s with a non-JSON response: %s",
+                    res.status_code,
+                    res.text[:300],
+                )
+                response_data = None
+            if (
+                res.is_success
+                and isinstance(response_data, dict)
+                and response_data.get("ok") is True
+            ):
+                logging.info(
+                    "Detection alert sent for contract %s (reminder: %s).",
+                    contract,
+                    is_reminder,
+                )
+                return
+            description = (
+                response_data.get("description", "Telegram returned ok=false.")
+                if isinstance(response_data, dict)
+                else "Telegram returned an invalid response."
             )
-            return
-        if res.is_success and response_data.get("ok") is True:
-            logging.info(f"Alert sent with mint button for contract: {contract} (Reminder: {is_reminder})")
-        else:
             logging.error(
-                "Telegram sendMessage failed (HTTP %s): %s",
+                "Telegram detection alert failed (attempt %s/3, HTTP %s): %s",
+                attempt + 1,
                 res.status_code,
-                response_data.get("description", "Telegram returned ok=false"),
+                description,
             )
-    except Exception as e:
-        logging.error(f"Failed sending alert: {e}")
+        except httpx.HTTPError:
+            logging.exception(
+                "Telegram detection alert request failed (attempt %s/3) for %s.",
+                attempt + 1,
+                contract,
+            )
+        if attempt < 2:
+            await asyncio.sleep(attempt + 1)
 
 
 # ==========================================
@@ -1372,6 +1390,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
                     func_name=record["function_name"],
                     tx_hash=tx_hash,
                     quality_report=quality_report,
+                    access_gate=f"Configured agent wallet only ({access_reason})",
                     is_reminder=True,
                     manual_mint_available=queue_status not in {"queued", "already_exists"},
                 )
@@ -1428,6 +1447,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
             func_name,
             tx_hash,
             quality_report,
+            access_gate=f"Configured agent wallet only ({reason})",
             is_reminder=False,
             manual_mint_available=queue_status not in {"queued", "already_exists"},
         )

@@ -34,8 +34,8 @@ for logger_name in ["httpx", "httpcore", "urllib3", "requests"]:
 # ==========================================
 # CONFIGURATION & HIGH-SPEED RPC POOLS
 # ==========================================
-BSC_WSS_URL = os.getenv("BSC_WSS_URL", "wss://rpc-bsc.blockmachine.io")
-BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-rpc.publicnode.com")
+BSC_WSS_URL = os.getenv("BSC_WSS_URL")
+BSC_HTTP_URL = os.getenv("BSC_HTTP_URL")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")

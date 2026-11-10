@@ -43,7 +43,7 @@ BSC_HTTP_URL = os.getenv("BSC_HTTP_URL", "https://bsc-dataseed1.binance.org/")
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentic_mints.db")
 BSC_CHAIN_ID = 56
-AUTO_MINT_THRESHOLD = 4
+AUTO_MINT_THRESHOLD = 6
 WALLET_NOT_CONNECTED_ERROR = "Binance Agentic Wallet is not connected."
 RPC_RECEIPT_TIMEOUT = 36  # Seconds to poll for transaction receipt
 RPC_POLL_INTERVAL = 2  # Seconds between receipt checks

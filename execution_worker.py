@@ -321,7 +321,7 @@ def generate_qr_bytes(url: str) -> bytes:
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, format="PNG") # type: ignore
     return buf.getvalue()
 
 
@@ -376,6 +376,12 @@ async def ensure_wallet_connected():
     if not MY_AGENTIC_WALLET:
         raise WalletCLIError("MY_AGENTIC_WALLET is not configured in .env.")
 
+    logger.info(
+        "Automatic mint score threshold configured to %s/%s checks.",
+        nft_scanner.AUTO_MINT_THRESHOLD,
+        nft_scanner.MAX_QUALITY_CHECKS,
+    )
+
     address_data = await run_baw(["wallet", "address", "--json"])
     bsc_address = next(
         (
@@ -412,6 +418,29 @@ async def execute_agentic_mint(
 
     try:
         preflight = await preflight_mint(contract_address, function_name, 0)
+        quality_report = preflight.get("quality_report")
+        if (
+            not isinstance(quality_report, dict)
+            or not nft_scanner.quality_score_meets_threshold(quality_report)
+        ):
+            score = (
+                quality_report.get("passed_count", "unknown")
+                if isinstance(quality_report, dict)
+                else "unknown"
+            )
+            reason = (
+                f"Quality score {score}/{nft_scanner.MAX_QUALITY_CHECKS} is below "
+                f"the configured auto-mint threshold "
+                f"{nft_scanner.AUTO_MINT_THRESHOLD}/"
+                f"{nft_scanner.MAX_QUALITY_CHECKS}."
+            )
+            await telegram_service.send_message(
+                f"⛔ <b>Auto-mint blocked by score threshold.</b>\n"
+                f"<b>Contract:</b> <code>{contract_address}</code>\n"
+                f"<b>Reason:</b> {html.escape(reason)}"
+            )
+            return "blocked", reason
+
         if (
             preflight.get("safe") is not True
             or preflight.get("auto_mint_eligible") is not True
@@ -929,7 +958,7 @@ async def poll_db_auto_mints():
                 status, result = await execute_agentic_mint(
                     contract,
                     func_name,
-                    trigger_source=f"AUTO (Technical checks: {score}/4)",
+                    trigger_source=f"AUTO (Quality checks: {score}/{nft_scanner.MAX_QUALITY_CHECKS})",
                 )
 
                 now = time.strftime("%Y-%m-%d %H:%M:%S")

@@ -18,9 +18,10 @@ from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
 from web3.types import BlockIdentifier, FilterParams, TxParams, Wei
 from hexbytes import HexBytes
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
-load_dotenv(Path(__file__).resolve().with_name(".env"))
+DOTENV_PATH = Path(__file__).resolve().with_name(".env")
+load_dotenv(DOTENV_PATH)
 
 # ==========================================
 # 1. LOGGING CONFIGURATION & NOISE MUTE
@@ -124,9 +125,12 @@ ERC2981_ROYALTY_INTERFACE_ID = "0x2a55205a"
 
 DB_FILE = Path(__file__).resolve().with_name("agentic_mints.db")
 MAX_QUALITY_CHECKS = 7
+_AUTO_MINT_THRESHOLD_VALUE = dotenv_values(DOTENV_PATH).get("AUTO_MINT_THRESHOLD")
+if _AUTO_MINT_THRESHOLD_VALUE is None:
+    _AUTO_MINT_THRESHOLD_VALUE = os.getenv("AUTO_MINT_THRESHOLD", "6")
 try:
-    AUTO_MINT_THRESHOLD = int(os.getenv("AUTO_MINT_THRESHOLD", "6"))
-except ValueError as error:
+    AUTO_MINT_THRESHOLD = int(_AUTO_MINT_THRESHOLD_VALUE)
+except (TypeError, ValueError) as error:
     raise ValueError("AUTO_MINT_THRESHOLD must be an integer from 0 to 7.") from error
 if not 0 <= AUTO_MINT_THRESHOLD <= MAX_QUALITY_CHECKS:
     raise ValueError("AUTO_MINT_THRESHOLD must be an integer from 0 to 7.")
@@ -273,11 +277,27 @@ def mint_cost_policy_description() -> str:
     return f"up to {MAX_MINT_COST_BNB.normalize():g} BNB"
 
 
+def quality_score_meets_threshold(quality_report: dict) -> bool:
+    score_checks = quality_report.get("score_checks")
+    if (
+        not isinstance(score_checks, dict)
+        or len(score_checks) != MAX_QUALITY_CHECKS
+        or any(type(passed) is not bool for passed in score_checks.values())
+    ):
+        return False
+
+    passed_count = sum(score_checks.values())
+    return (
+        passed_count == quality_report.get("passed_count")
+        and passed_count >= AUTO_MINT_THRESHOLD
+    )
+
+
 def is_auto_mint_eligible(quality_report: dict) -> bool:
     required_checks = quality_report.get("required_checks")
     return bool(
         quality_report.get("auto_mint_safe") is True
-        and quality_report.get("passed_count", 0) >= AUTO_MINT_THRESHOLD
+        and quality_score_meets_threshold(quality_report)
         and isinstance(required_checks, dict)
         and required_checks
         and all(value is True for value in required_checks.values())
@@ -304,7 +324,7 @@ def add_required_mint_checks(
         f"Required check failed or is unknown: {name}." for name in failed
     )
     quality_report["auto_mint_safe"] = (
-        quality_report.get("passed_count", 0) >= AUTO_MINT_THRESHOLD
+        quality_score_meets_threshold(quality_report)
         and all(required_checks.values())
     )
     return quality_report
@@ -1177,7 +1197,12 @@ async def run_quality_checks(
         "supply_scarce": supply_scarce,
         "core_checks": core_checks,
         "score_checks": score_checks,
-        "auto_mint_safe": passed_count >= AUTO_MINT_THRESHOLD,
+        "auto_mint_safe": quality_score_meets_threshold(
+            {
+                "score_checks": score_checks,
+                "passed_count": passed_count,
+            }
+        ),
         "auto_mint_blockers": blockers,
         "details": results,
     }
@@ -1469,7 +1494,7 @@ async def listen_onchain_websocket():
         while True:
             try:
                 async with websockets.connect(
-                    BSC_WSS_URL,
+                    BSC_WSS_URL, # type: ignore
                     open_timeout=15,
                     ping_interval=20,
                     ping_timeout=20,

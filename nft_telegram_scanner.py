@@ -1218,6 +1218,7 @@ async def send_telegram_alert(
     tx_hash: str,
     quality_report: dict,
     access_gate: str,
+    queue_status: str | None = None,
     is_reminder: bool = False,
     manual_mint_available: bool = True,
 ):
@@ -1228,7 +1229,11 @@ async def send_telegram_alert(
     header_title = (
         "⏰ <b>1-HOUR REMINDER: UNMINTED NFT</b> ⏰"
         if is_reminder
-        else "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨"
+        else (
+            "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED — AUTOMINT QUEUED</b> 🚨"
+            if queue_status == "queued"
+            else "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED</b> 🚨"
+        )
     )
 
     message = (
@@ -1252,6 +1257,7 @@ async def send_telegram_alert(
         f"{html.escape(str(details.get('4_admin_controls', 'Not checked')))}\n"
         f"7️⃣ <b>Supply/Royalties:</b> "
         f"{html.escape(str(details.get('7_supply_and_royalties', 'Not checked')))}\n\n"
+        f"{'🤖 <b>Auto-mint status:</b> Queued\n' if queue_status == 'queued' else ''}"
         f"🔗 <b>BscScan:</b> https://bscscan.com/address/{html.escape(contract)}\n"
         f"⚡️ <b>Detected TX:</b> https://bscscan.com/tx/{html.escape(tx_hash)}"
     )
@@ -1391,6 +1397,7 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
                     tx_hash=tx_hash,
                     quality_report=quality_report,
                     access_gate=f"Configured agent wallet only ({access_reason})",
+                    queue_status=queue_status,
                     is_reminder=True,
                     manual_mint_available=queue_status not in {"queued", "already_exists"},
                 )
@@ -1448,10 +1455,16 @@ async def process_contract_candidate(http_client: httpx.AsyncClient, contract_ad
             tx_hash,
             quality_report,
             access_gate=f"Configured agent wallet only ({reason})",
+            queue_status=queue_status,
             is_reminder=False,
             manual_mint_available=queue_status not in {"queued", "already_exists"},
         )
-        logging.info("Detected eligible %s NFT %s; Telegram alert attempted.", nft_standard, addr)
+        logging.info(
+            "Detected %s NFT %s; auto-mint queue status: %s.",
+            nft_standard,
+            addr,
+            queue_status,
+        )
 
     except Exception:
         logging.exception("Failed processing mint candidate %s (tx %s).", addr, tx_hash)

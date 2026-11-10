@@ -461,7 +461,32 @@ class TelegramNftFeatures:
 
         queue_status = assessment.get("queue_status")
         if queue_status == "queued":
-            message += "\n🤖 Score qualifies; automatic minting has been queued."
+            message = (
+                "🚨 <b>EXCLUSIVE AGENTIC FREE NFT DETECTED — AUTOMINT QUEUED</b> 🚨\n\n"
+                f"📄 <b>Contract Address:</b> <code>{html.escape(contract)}</code>\n"
+                f"🎨 <b>NFT Standard:</b> ✅ {standard}\n"
+                f"🛡️ <b>Access Gate:</b> 🔒 {access_gate}\n"
+                f"⚙️ <b>Function:</b> {escaped_function}\n\n"
+                f"📊 <b>Quality Score:</b> "
+                f"<b>{quality_report['passed_count']}/7 Passed</b>\n"
+                f"1️⃣ <b>On-Chain Activity:</b> "
+                f"{html.escape(str(details.get('5_activity', 'Not checked')))}\n"
+                f"2️⃣ <b>Metadata Integrity:</b> "
+                f"{html.escape(str(details.get('1_metadata', 'Not checked')))}\n"
+                f"3️⃣ <b>Source Code:</b> "
+                f"{html.escape(str(details.get('2_source', 'Not checked')))}\n"
+                f"4️⃣ <b>Minter Diversity:</b> "
+                f"{html.escape(str(details.get('6_distribution', 'Not checked')))}\n"
+                f"5️⃣ <b>Proxy Safety:</b> "
+                f"{html.escape(str(details.get('3_proxy', 'Not checked')))}\n"
+                f"6️⃣ <b>Admin Controls:</b> "
+                f"{html.escape(str(details.get('4_admin_controls', 'Not checked')))}\n"
+                f"7️⃣ <b>Supply/Royalties:</b> "
+                f"{html.escape(str(details.get('7_supply_and_royalties', 'Not checked')))}\n\n"
+                "🤖 <b>Auto-mint status:</b> Queued\n"
+                f"🔗 <b>BscScan:</b> https://bscscan.com/address/{html.escape(contract)}\n"
+                "⚡️ <b>Detected TX:</b> Not available for a manual contract scan."
+            )
         elif queue_status == "already_exists":
             message += "\nℹ️ A mint record already exists for this contract and function; no duplicate was queued."
         elif assessment.get("auto_mint_eligible"):
@@ -496,6 +521,20 @@ class TelegramNftFeatures:
                     }
                 ]]
             }
+        if queue_status == "queued":
+            for attempt in range(3):
+                response = await self.telegram_service.send_message(message)
+                if response and response.get("ok") is True:
+                    return
+                logger.error(
+                    "Queued NFT detection notification failed (attempt %s/3) for %s.",
+                    attempt + 1,
+                    contract,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(attempt + 1)
+            return
+
         await self.telegram_service.send_message(message, reply_markup=reply_markup)
 
     async def _handle_manual_mint_request(self, callback_query: dict) -> bool:

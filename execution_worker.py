@@ -204,7 +204,31 @@ class TelegramService:
                 payload["reply_markup"] = reply_markup
             try:
                 resp = await client.post(f"{self.api_base}/sendMessage", json=payload)
-                return resp.json()
+                try:
+                    result = resp.json()
+                except ValueError:
+                    logger.error(
+                        "Telegram sendMessage returned invalid JSON (HTTP %s).",
+                        resp.status_code,
+                    )
+                    return None
+                if (
+                    resp.status_code != 200
+                    or not isinstance(result, dict)
+                    or result.get("ok") is not True
+                ):
+                    description = (
+                        result.get("description", "Telegram API rejected the message.")
+                        if isinstance(result, dict)
+                        else "Telegram API returned an invalid response."
+                    )
+                    logger.error(
+                        "Telegram sendMessage failed (HTTP %s): %s",
+                        resp.status_code,
+                        description,
+                    )
+                    return result if isinstance(result, dict) else None
+                return result
             except Exception as e:
                 logger.error(f"Failed to send Telegram message: {e}")
                 return None
@@ -543,22 +567,12 @@ async def execute_agentic_mint(
             execution_status = execution.get("status")
             return "failed", f"Execution did not broadcast. Status: {execution_status}"
 
-        # 3. Verify transaction outcome on-chain and report back to Telegram
+        # 3. Verify the transaction outcome and expected NFT transfer on-chain.
         receipt_success, block_num, err_detail = await verify_mint_transaction(
             tx_hash, contract_address, wallet_address
         )
-        bscscan_link = f"https://bscscan.com/tx/{tx_hash}"
 
         if receipt_success:
-            await telegram_service.send_message(
-                f"🟢 <b>AUTONOMOUS MINT SUCCESSFUL!</b>\n\n"
-                f"<b>Contract:</b> <code>{contract_address}</code>\n"
-                f"<b>Function:</b> <code>{function_name}</code>\n"
-                f"<b>Source:</b> {trigger_source}\n"
-                f"<b>Block:</b> {block_num}\n"
-                f"<b>Mint verification:</b> {html.escape(err_detail)}\n"
-                f"🔗 <a href='{bscscan_link}'>View on BscScan</a>"
-            )
             return "success", tx_hash
         else:
             await telegram_service.send_message(
@@ -974,12 +988,60 @@ async def poll_db_auto_mints():
                     (status, tx_hash, order_id, error_log, now, mint_id),
                 )
                 conn.commit()
+                if status == "success":
+                    await send_auto_mint_notification(
+                        contract,
+                        func_name,
+                        score,
+                        result,
+                    )
         except Exception as e:
             logger.error(f"Error in DB Poller: {e}")
         finally:
             if conn is not None:
                 conn.close()
         await asyncio.sleep(3)
+
+
+async def send_auto_mint_notification(
+    contract_address: str,
+    function_name: str,
+    quality_score: int,
+    tx_hash: str,
+) -> None:
+    message = (
+        "🟢 <b>AUTOMINT SUCCESSFUL — NFT VERIFIED</b>\n\n"
+        f"<b>Contract:</b> <code>{html.escape(contract_address)}</code>\n"
+        f"<b>Function:</b> <code>{html.escape(function_name)}</code>\n"
+        f"<b>Quality score:</b> {quality_score}/{nft_scanner.MAX_QUALITY_CHECKS}\n"
+        f"<b>Transaction:</b> <a href='https://bscscan.com/tx/{html.escape(tx_hash)}'>"
+        "View on BscScan</a>"
+    )
+    for attempt in range(3):
+        try:
+            response = await telegram_service.send_message(message)
+        except Exception:
+            logger.exception(
+                "Telegram automint notification attempt %s failed for contract %s.",
+                attempt + 1,
+                contract_address,
+            )
+            response = None
+        if response and response.get("ok") is True:
+            logger.info(
+                "Telegram automint notification sent for contract %s (tx %s).",
+                contract_address,
+                tx_hash,
+            )
+            return
+        if attempt < 2:
+            await asyncio.sleep(attempt + 1)
+
+    logger.error(
+        "Telegram automint notification failed after 3 attempts for contract %s (tx %s).",
+        contract_address,
+        tx_hash,
+    )
 
 
 async def poll_telegram_updates():
